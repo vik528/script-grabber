@@ -11,12 +11,21 @@ name: Build standalone executables
 # together, deliberately, same as the Dockerfile's own comment says.
 #
 # Linux builds on every push/PR (cheap, standard-rate runner). macOS/Windows
-# only build on a tag push or manual dispatch — this repo is private, and
-# GitHub bills macOS minutes at 10x / Windows at 2x, so routine pushes don't
-# pay for that.
+# only build on a tag push, a push to `dev`, or manual dispatch — this repo
+# is private, and GitHub bills macOS minutes at 10x / Windows at 2x, so
+# routine pushes to `main` don't pay for that.
+#
+# Two release channels:
+#   - Production: push a `v*` tag on `main` -> the `release` job publishes a
+#     normal (non-prerelease) GitHub Release, versioned assets.
+#   - Dev/testing: push to the `dev` branch -> the `release-dev` job
+#     publishes/updates ONE rolling pre-release tagged `dev-latest` (assets
+#     overwritten each push, not accumulated) — always the same download
+#     link, clearly marked "Pre-release" so it's never mistaken for a
+#     production build.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -50,9 +59,10 @@ jobs:
 
   build-macos:
     # This repo is private, and GitHub bills macOS runner-minutes at 10x —
-    # only build it on a tag push (about to cut a release) or an explicit
-    # manual dispatch, not on every routine push/PR.
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # only build it on a tag push (about to cut a release), a push to the
+    # `dev` branch (about to cut a dev/testing build), or an explicit manual
+    # dispatch — not on every routine push/PR to `main`.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/dev' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -114,8 +124,8 @@ jobs:
 
   build-windows:
     # Same rationale as build-macos above — Windows runner-minutes bill at
-    # 2x, so this is also gated to tag pushes / manual dispatch only.
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # 2x, so this is also gated to tag pushes / dev pushes / manual dispatch.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/dev' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -191,3 +201,61 @@ jobs:
           # for the first tag is a single squash commit whose message isn't
           # meant to be read as release notes.
           body_path: CHANGELOG.md
+
+  release-dev:
+    # Rolling dev/testing channel: every push to `dev` overwrites this ONE
+    # pre-release's assets rather than accumulating a new release per push —
+    # always the same download link (.../releases/tag/dev-latest), and
+    # marked Pre-release so it's never mistaken for a production build.
+    if: github.ref == 'refs/heads/dev'
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # softprops/action-gh-release updates an existing release's body/
+      # assets/prerelease-flag when the same tag_name is reused, but does
+      # NOT move the underlying git tag ref to the new commit on its own —
+      # do that explicitly so dev-latest always points at the exact commit
+      # whose code produced the attached executables, not a stale one.
+      - name: Move the dev-latest tag to this commit
+        run: |
+          git tag -f dev-latest
+          git push -f origin dev-latest
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename assets for the dev channel, restore the executable bit
+        run: |
+          mkdir -p release-dev
+          cp artifacts/script-grabber-linux/script-grabber-linux release-dev/script-grabber-dev-latest-linux
+          cp artifacts/script-grabber-macos-arm64/script-grabber-macos-arm64 release-dev/script-grabber-dev-latest-macos-arm64
+          cp artifacts/script-grabber-macos-intel/script-grabber-macos-intel release-dev/script-grabber-dev-latest-macos-intel
+          cp artifacts/script-grabber-windows/script-grabber-windows.exe release-dev/script-grabber-dev-latest-windows.exe
+          chmod +x release-dev/script-grabber-dev-latest-linux
+          chmod +x release-dev/script-grabber-dev-latest-macos-arm64
+          chmod +x release-dev/script-grabber-dev-latest-macos-intel
+
+      - name: Write dev-build release notes
+        run: |
+          {
+            echo "# Dev / testing build — NOT for production use"
+            echo ""
+            echo "Automatically built from the \`dev\` branch, commit \`${GITHUB_SHA::7}\`:"
+            echo ""
+            git log -1 --format='> %s'
+            echo ""
+            echo "This release is overwritten on every push to \`dev\` — it always reflects the latest in-progress work, not a stable version. For the current production release, see the [Releases page](../../releases) for the newest non-prerelease tag."
+          } > release-dev-notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "dev-latest (testing build)"
+          prerelease: true
+          body_path: release-dev-notes.md
+          files: release-dev/*
