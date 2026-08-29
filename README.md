@@ -215,10 +215,29 @@ triggered by routine pushes:
 Every job runs the `PYLON_CAMEMU` emulator smoke test before publishing its
 artifact — a build that doesn't actually find/capture from emulated cameras
 fails the job rather than silently shipping. Push a tag matching `v*` (e.g.
-`v1.2.0`) to also publish all three executables to a GitHub Release. **Real
+`v1.2.0`) to also publish all four executables to a GitHub Release. **Real
 GigE hardware discovery is only proven on Linux so far** (see above) — the
 macOS/Windows CI builds are emulator-verified only; treat them the same way
 Linux was treated before its own real-hardware pass.
+
+### Dev/testing builds vs. production releases
+
+Two separate channels, both on GitHub Releases:
+
+- **Production**: a `v*` tag pushed on `main` (e.g. `v1.2.0`) — a normal,
+  permanent, versioned release. This is what to point anyone at by default.
+- **Dev/testing**: any push to the `dev` branch — builds and updates **one
+  rolling pre-release**, tagged `dev-latest`
+  (`.../releases/tag/dev-latest`, always the same link). Its 4 assets
+  (`script-grabber-dev-latest-{linux,macos-arm64,macos-intel,windows.exe}`)
+  get **overwritten** on every push — it does not keep old dev builds
+  around. Marked "Pre-release" on GitHub so it's never mistaken for a
+  production release. Use this to hand someone an in-progress feature to
+  try before it's tagged.
+
+Workflow: do work on `dev`, push to get a testable build of everyone's
+current in-progress state, then merge `dev` into `main` and tag a version
+once it's ready to be "the" release.
 
 **Downloading a Release asset**: GitHub Release assets don't preserve the
 executable bit — after downloading, run `chmod +x script-grabber-linux` or
