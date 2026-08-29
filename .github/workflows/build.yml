@@ -162,6 +162,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for CHANGELOG.md below (body_path) — this job otherwise only
+      # touches downloaded artifacts, nothing from the repo itself.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
