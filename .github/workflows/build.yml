@@ -1,0 +1,182 @@
+name: Build standalone executables
+
+# Runs the same three-platform build this project has already validated by
+# hand: Linux via the existing Docker image (packaging/linux/Dockerfile,
+# reused as-is rather than reimplemented as native runner steps — it already
+# encodes the glibc-2.31 floor and the PyInstaller symlink-bug fix), macOS
+# and Windows as native PyInstaller builds on GitHub-hosted runners.
+#
+# Version pins for pypylon/pyinstaller/pyinstaller-hooks-contrib are kept in
+# sync by hand with packaging/linux/Dockerfile's ARG defaults — bump both
+# together, deliberately, same as the Dockerfile's own comment says.
+#
+# Linux builds on every push/PR (cheap, standard-rate runner). macOS/Windows
+# only build on a tag push or manual dispatch — this repo is private, and
+# GitHub bills macOS minutes at 10x / Windows at 2x, so routine pushes don't
+# pay for that.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  PYPYLON_VERSION: "26.7"
+  PYINSTALLER_VERSION: "6.22.2"
+  PYINSTALLER_HOOKS_CONTRIB_VERSION: "2026.7"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build via existing Dockerfile (bakes in the emulator smoke test)
+        run: docker build -f packaging/linux/Dockerfile -t script-grabber-build .
+
+      - name: Extract executable from the build image
+        run: |
+          docker create --name sg-extract script-grabber-build
+          docker cp sg-extract:/build/dist/script-grabber ./script-grabber-linux
+          docker rm sg-extract
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: script-grabber-linux
+          path: script-grabber-linux
+          if-no-files-found: error
+
+  build-macos:
+    # This repo is private, and GitHub bills macOS runner-minutes at 10x —
+    # only build it on a tag push (about to cut a release) or an explicit
+    # manual dispatch, not on every routine push/PR.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Explicit version-pinned labels, not "macos-latest": that label is
+          # mid-migration between macOS releases as of mid-2026, and a build
+          # whose dependency versions are pinned for reproducibility shouldn't
+          # sit on a runner OS that can silently change under it.
+          - runner: macos-15
+            artifact_name: script-grabber-macos-arm64
+          # pypylon ships separate arm64/x86_64 wheels, no universal2 (checked
+          # directly against PyPI) — an arm64 runner can only ever produce an
+          # arm64 executable, so Intel needs its own job, not a fat binary.
+          - runner: macos-15-intel
+            artifact_name: script-grabber-macos-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pypylon==${{ env.PYPYLON_VERSION }}" \
+            "pyinstaller==${{ env.PYINSTALLER_VERSION }}" \
+            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}"
+          # Plain "import tkinter" only catches a hard import failure, not
+          # the Tcl/Tk *linkage* error that has recurred across multiple
+          # GitHub-hosted macOS runner generations and only surfaces once a
+          # widget/root window is actually constructed (actions/runner-images
+          # #4931, #6442, #11074, #9441) — so construct one here.
+          python -c "import tkinter; r = tkinter.Tk(); r.destroy()"
+
+      - name: Build with PyInstaller
+        # Plain --onefile, no custom .spec: confirmed by direct local testing
+        # (2026-08-28, Apple Silicon) that the top-level-symlink duplication
+        # PyInstaller performs for a couple of pypylon's Basler libraries here
+        # (libNodeMapData/libMathParser .dylib) does NOT break camera
+        # discovery on macOS the way the equivalent symlinks did on Linux —
+        # the PYLON_CAMEMU emulator smoke test below passed with a plain
+        # onefile build. Revisit with a custom .spec only if a future
+        # pypylon/PyInstaller version regresses this.
+        run: pyinstaller --onefile --name ${{ matrix.artifact_name }} capture_cameras.py
+
+      - name: Emulator smoke test (no real cameras/display on this runner)
+        run: |
+          PYLON_CAMEMU=2 ./dist/${{ matrix.artifact_name }} --cameras all --count 2 --format tiff --outdir smoke_test_out
+          ls -la smoke_test_out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  build-windows:
+    # Same rationale as build-macos above — Windows runner-minutes bill at
+    # 2x, so this is also gated to tag pushes / manual dispatch only.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install `
+            "pypylon==${{ env.PYPYLON_VERSION }}" `
+            "pyinstaller==${{ env.PYINSTALLER_VERSION }}" `
+            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}"
+          python -c "import tkinter"
+
+      - name: Build with PyInstaller
+        # Plain --onefile: confirmed working on the first real CI run
+        # (2026-08-28), no local Windows machine ever pre-validated this.
+        # pyinstaller-hooks-contrib>=2024.0 fixed the only known pypylon+
+        # PyInstaller+Windows bundling bug (basler/pypylon#514); the pinned
+        # 2026.7 is well past that fix. No custom .spec needed here.
+        run: pyinstaller --onefile --name script-grabber-windows capture_cameras.py
+
+      - name: Emulator smoke test (no real cameras/display on this runner)
+        run: |
+          $env:PYLON_CAMEMU = "2"
+          ./dist/script-grabber-windows.exe --cameras all --count 2 --format tiff --outdir smoke_test_out
+          Get-ChildItem smoke_test_out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: script-grabber-windows
+          path: dist/script-grabber-windows.exe
+          if-no-files-found: error
+
+  release:
+    # Only runs when a version tag (e.g. v1.2.0) is pushed — a normal push to
+    # main just builds+smoke-tests, it doesn't publish a Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Restore executable bit (GitHub Actions artifacts don't preserve it)
+        run: |
+          chmod +x artifacts/script-grabber-linux/script-grabber-linux
+          chmod +x artifacts/script-grabber-macos-arm64/script-grabber-macos-arm64
+          chmod +x artifacts/script-grabber-macos-intel/script-grabber-macos-intel
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/script-grabber-linux/script-grabber-linux
+            artifacts/script-grabber-macos-arm64/script-grabber-macos-arm64
+            artifacts/script-grabber-macos-intel/script-grabber-macos-intel
+            artifacts/script-grabber-windows/script-grabber-windows.exe
+          generate_release_notes: true

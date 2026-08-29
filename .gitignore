@@ -1,0 +1,27 @@
+# OS cruft
+.DS_Store
+
+# Local Claude Code project files — the verify skill references a specific
+# customer's lab network/camera inventory, not appropriate for a shared repo.
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# PyInstaller build output — built by CI per-platform, never committed.
+# (script-grabber-linux itself predates this repo and is also excluded below.)
+build/
+dist/
+*.spec.bak
+script-grabber-linux
+script-grabber-macos*
+script-grabber-windows*
+script-grabber.exe
+
+# Local capture output, if a test run ever lands one here by mistake
+/out/
+/smoke_test_out/
+capture_manifest.json
