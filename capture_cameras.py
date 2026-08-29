@@ -62,6 +62,21 @@ FILE_FORMATS = {
 EXPOSURE_NODE_CANDIDATES = ("ExposureTime", "ExposureTimeAbs")
 GAIN_NODE_CANDIDATES = ("Gain", "GainRaw")
 
+# GigE diagnostics (GUI-only, read-only) — see read_gige_diagnostics().
+GIGE_PACKET_SIZE_NODE_NAME = "GevSCPSPacketSize"                    # device node map
+GIGE_RESEND_COUNT_NODE_NAME = "Statistic_Resend_Packet_Count"       # StreamGrabberNodeMap,
+                                                                      # same map AutoPacketSize
+                                                                      # already lives on
+# (node name, display label) — tried in order; falls back to a differently
+# labeled bandwidth metric rather than silently mislabeling it, since
+# Basler's own docs don't confirm DeviceLinkSpeed is exposed on all their
+# GigE cameras (SFNC-standard node; presence not verified against real
+# Basler hardware yet).
+GIGE_LINK_SPEED_NODE_CANDIDATES = (
+    ("DeviceLinkSpeed", "Link Speed"),
+    ("GevSCBWA", "Bandwidth Assigned"),
+)
+
 
 def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
@@ -291,6 +306,67 @@ def log_camera_state(camera, label: str) -> None:
         rd(*EXPOSURE_NODE_CANDIDATES), rd(*GAIN_NODE_CANDIDATES),
         rd("PixelFormat"), rd("Width"), rd("Height"), rd("TriggerMode"),
     )
+
+
+def read_gige_diagnostics(camera, serial: str) -> dict:
+    """Best-effort, read-only GigE diagnostics snapshot for one already-open
+    camera: current packet size, cumulative resend-packet count, and link
+    speed (or a differently-labeled bandwidth fallback — see
+    GIGE_LINK_SPEED_NODE_CANDIDATES). GUI-only (Rescan / the "Show GigE
+    Diagnostics" toggle) — never called from the CLI path or during a
+    capture. Values are "n/a" for anything this camera doesn't expose
+    (expected for USB3/emulated devices) — never raises.
+
+    UNCONFIRMED, needs a real-hardware check before trusting blindly (same
+    bar as AutoPacketSize/GevSCBWA got): (1) whether
+    Statistic_Resend_Packet_Count persists across separate Open()/Close()
+    cycles, so a later on-demand read still reflects an earlier capture's
+    actual resend activity, or resets to 0 on every fresh Open() — if it
+    resets, this diagnostic is only meaningful read *within* the same open
+    session as the capture being diagnosed, not from a later Rescan/toggle
+    click; (2) the assumed Bytes/sec unit for DeviceLinkSpeed (inferred from
+    its sibling GevSCBWA/GevSCDMT nodes' confirmed Bytes/sec convention, not
+    independently confirmed for DeviceLinkSpeed itself).
+    """
+    result = {"packet_size": "n/a", "resend_count": "n/a",
+              "link_label": "Link Speed", "link_value": "n/a"}
+
+    node = getattr(camera, GIGE_PACKET_SIZE_NODE_NAME, None)
+    if node is not None:
+        try:
+            if genicam.IsAvailable(node):
+                val = read_node(node)
+                if val is not None:
+                    result["packet_size"] = f"{val} B"
+        except Exception:
+            LOG.exception("%s: could not read %s", serial, GIGE_PACKET_SIZE_NODE_NAME)
+
+    try:
+        sg_nodemap = camera.GetStreamGrabberNodeMap()
+        resend_node = sg_nodemap.GetNode(GIGE_RESEND_COUNT_NODE_NAME)
+        if resend_node is not None and genicam.IsAvailable(resend_node):
+            val = read_node(resend_node)
+            if val is not None:
+                result["resend_count"] = str(val)
+    except Exception:
+        LOG.exception("%s: could not read %s", serial, GIGE_RESEND_COUNT_NODE_NAME)
+
+    for name, label in GIGE_LINK_SPEED_NODE_CANDIDATES:
+        node = getattr(camera, name, None)
+        if node is None:
+            continue
+        try:
+            if not genicam.IsAvailable(node):
+                continue
+            val = read_node(node)
+            if val is None:
+                continue
+            result["link_label"] = label
+            result["link_value"] = f"{val / 1e6:.1f} MB/s"
+            break
+        except Exception:
+            LOG.exception("%s: could not read %s", serial, name)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -990,18 +1066,37 @@ def run_gui() -> int:
     lens_mm_vars = []
     lens_brand_vars = []
     lens_model_vars = []
+    diag_vars = []
+    diag_row_widgets = []
+    show_diag_var = tk.BooleanVar(value=False)
 
     cams_frame = ttk.Frame(root)
     cams_frame.pack(fill="x", padx=8, pady=8)
 
+    def copy_group_to_selected(source_idx):
+        # Reads group_vars/cam_vars by reference — always current, including
+        # right after a Rescan rebuilds both lists in place.
+        value = group_vars[source_idx].get()
+        targets = [i for i, v in enumerate(cam_vars) if v.get()]
+        if not targets:
+            messagebox.showwarning(
+                "No cameras selected",
+                "Check at least one camera to copy the Group value to.",
+            )
+            return
+        for i in targets:
+            group_vars[i].set(value)
+        status_var.set(f"Copied Group '{value}' to {len(targets)} camera(s).")
+
     def build_camera_rows():
         # Rebuildable so Rescan can pick up cameras connected after the
         # window was already opened, without restarting the GUI. Mutates
-        # devices/cam_vars/exposure_vars/group_vars/lens_*_vars IN PLACE
-        # (clear + re-populate) rather than rebinding them, so every other
-        # closure in this function (worker/start_capture/apply_settings/
-        # load_current_settings) — all defined once, reading these same
-        # list objects by reference — sees the rebuilt contents automatically.
+        # devices/cam_vars/exposure_vars/group_vars/lens_*_vars/diag_vars IN
+        # PLACE (clear + re-populate) rather than rebinding them, so every
+        # other closure in this function (worker/start_capture/
+        # apply_settings/load_current_settings/refresh_gige_diagnostics) —
+        # all defined once, reading these same list objects by reference —
+        # sees the rebuilt contents automatically.
         for child in cams_frame.winfo_children():
             child.destroy()
         cam_vars.clear()
@@ -1010,6 +1105,8 @@ def run_gui() -> int:
         lens_mm_vars.clear()
         lens_brand_vars.clear()
         lens_model_vars.clear()
+        diag_vars.clear()
+        diag_row_widgets.clear()
 
         if not devices:
             ttk.Label(
@@ -1041,7 +1138,11 @@ def run_gui() -> int:
             group_var = tk.StringVar()
             group_vars.append(group_var)
             ttk.Label(row, text="Group:").pack(side="left", padx=(8, 0))
-            ttk.Entry(row, textvariable=group_var, width=4).pack(side="left")
+            ttk.Entry(row, textvariable=group_var, width=14).pack(side="left")
+            ttk.Button(
+                row, text="Copy", width=6,
+                command=lambda i=i: copy_group_to_selected(i),
+            ).pack(side="left", padx=(4, 0))
 
             # Second, indented sub-row: lens info — pure session
             # documentation, never written to the camera. Kept on its own
@@ -1063,6 +1164,19 @@ def run_gui() -> int:
             ttk.Label(lens_row, text="Model (optional):").pack(side="left", padx=(8, 0))
             ttk.Entry(lens_row, textvariable=lens_model_var, width=14).pack(side="left")
 
+            # Third, indented sub-row: GigE diagnostics — hidden unless
+            # "Show GigE Diagnostics" is checked (see that Checkbutton
+            # below). Created every rebuild either way so the toggle can
+            # show/hide it without a rescan; visibility here at build time
+            # just matches whatever the toggle's current state already is.
+            diag_var = tk.StringVar(value="GigE diagnostics: not read yet.")
+            diag_vars.append(diag_var)
+            diag_row = ttk.Frame(block)
+            ttk.Label(diag_row, textvariable=diag_var).pack(side="left")
+            diag_row_widgets.append(diag_row)
+            if show_diag_var.get():
+                diag_row.pack(fill="x", padx=(24, 0), pady=(1, 0))
+
     build_camera_rows()
 
     ttk.Label(
@@ -1077,6 +1191,14 @@ def run_gui() -> int:
              "alongside the images — never written to the camera. All three "
              "fields may be left blank.",
     ).pack(fill="x", padx=8, pady=(0, 4))
+    ttk.Checkbutton(
+        root,
+        text="Show GigE Diagnostics (packet size / resend count / link speed) "
+             "— opens each camera briefly to read; check after a capture to "
+             "look for dropped-packet signs over a switch",
+        variable=show_diag_var,
+        command=lambda: on_toggle_diagnostics(),
+    ).pack(anchor="w", padx=8, pady=(0, 4))
 
     def _read_first(cam, names, default=""):
         for n in names:
@@ -1147,6 +1269,43 @@ def run_gui() -> int:
                 if cam.IsOpen():
                     cam.Close()
         status_var.set("Settings applied.")
+
+    def refresh_gige_diagnostics():
+        # On-demand snapshot (open -> read -> close), like
+        # load_current_settings() — never holds a camera open continuously,
+        # so it can't block Capture from acquiring it. See
+        # read_gige_diagnostics()'s docstring for what "on-demand" means for
+        # the resend-count reading specifically (unconfirmed against real
+        # hardware whether it's still meaningful this way).
+        for i, d in enumerate(devices):
+            cam = _create_camera_or_report(d)
+            if cam is None:
+                diag_vars[i].set("GigE diagnostics: could not connect.")
+                continue
+            try:
+                if not _open_or_report(cam, d.GetSerialNumber()):
+                    diag_vars[i].set("GigE diagnostics: could not open camera.")
+                    continue
+                diag = read_gige_diagnostics(cam, d.GetSerialNumber())
+                diag_vars[i].set(
+                    f"Packet Size: {diag['packet_size']}   "
+                    f"Resends: {diag['resend_count']}   "
+                    f"{diag['link_label']}: {diag['link_value']}"
+                )
+            finally:
+                if cam.IsOpen():
+                    cam.Close()
+        status_var.set("GigE diagnostics refreshed.")
+
+    def on_toggle_diagnostics():
+        show = show_diag_var.get()
+        for w in diag_row_widgets:
+            if show:
+                w.pack(fill="x", padx=(24, 0), pady=(1, 0))
+            else:
+                w.pack_forget()
+        if show:
+            refresh_gige_diagnostics()
 
     bottom = ttk.Frame(root)
     bottom.pack(fill="x", padx=8, pady=(0, 8))
@@ -1276,6 +1435,8 @@ def run_gui() -> int:
         if devices:
             load_current_settings()
             status_var.set(f"Found {len(devices)} camera(s).")
+            if show_diag_var.get():
+                refresh_gige_diagnostics()  # overwrites the status line above with its own
         else:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
 
