@@ -208,6 +208,12 @@ jobs:
     # always the same download link (.../releases/tag/dev-latest), and
     # marked Pre-release so it's never mistaken for a production build.
     if: github.ref == 'refs/heads/dev'
+    # Two dev pushes landing close together would otherwise race to force-
+    # move the same dev-latest tag and PATCH the same release — the newer
+    # push should win outright, not fight the older one for it.
+    concurrency:
+      group: release-dev
+      cancel-in-progress: true
     needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
