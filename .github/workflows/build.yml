@@ -182,4 +182,8 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          generate_release_notes: true
+          # CHANGELOG.md as the release body, not generate_release_notes —
+          # auto-generated notes draw from the full commit history, which
+          # for the first tag is a single squash commit whose message isn't
+          # meant to be read as release notes.
+          body_path: CHANGELOG.md
