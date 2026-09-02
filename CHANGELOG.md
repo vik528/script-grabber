@@ -3,6 +3,27 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.2.0 — 2026-09-01
+
+GUI visual polish only — capture, grouping, PTP, lens-manifest, rescan,
+apply-settings, threading, and CLI behavior are unchanged.
+
+- Dori-themed Tkinter/ttk shell: page background `#EAEEF0`, navy header
+  (`#224C5C`) with product name + version, teal primary Capture button
+  (`#17B696`), navy secondary actions (Rescan / Apply Settings / Browse).
+- Customer logo slot in the header (~44px). Click the placeholder to choose
+  a PNG/GIF/PPM image (stdlib `PhotoImage`; no Pillow). Path is persisted in
+  `~/.config/script-grabber/ui.json` (Linux/macOS) or
+  `%APPDATA%\script-grabber\ui.json` (Windows). Missing file falls back to
+  the placeholder. No logo is bundled.
+- Camera list restyled as white cards (model + serial, include checkbox,
+  Exposure/Group, quieter lens row). Centered empty state when none are
+  detected. Group/Lens help moved into a short hint + collapsible Help
+  panel (same text, no longer always-visible stacked labels).
+- Bottom action bar shows the output folder path. Status line uses
+  annotation colors (ok `#00695C` / warning `#FFAB40` / error `#B71C1C`) by
+  parsing existing status strings.
+
 ## 1.1.0 — 2026-08-28
 
 Project moved into git, hosted at github.com/vik528/script-grabber. Added
