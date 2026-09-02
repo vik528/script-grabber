@@ -3,7 +3,7 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
-## 1.2.0 — 2026-09-01
+## 1.2.0 — 2026-09-02
 
 GUI visual polish only — capture, grouping, PTP, lens-manifest, rescan,
 apply-settings, threading, and CLI behavior are unchanged.
@@ -11,11 +11,17 @@ apply-settings, threading, and CLI behavior are unchanged.
 - Dori-themed Tkinter/ttk shell: page background `#EAEEF0`, navy header
   (`#224C5C`) with product name + version, teal primary Capture button
   (`#17B696`), navy secondary actions (Rescan / Apply Settings / Browse).
-- Customer logo slot in the header (~44px). Click the placeholder to choose
-  a PNG/GIF/PPM image (stdlib `PhotoImage`; no Pillow). Path is persisted in
-  `~/.config/script-grabber/ui.json` (Linux/macOS) or
-  `%APPDATA%\script-grabber\ui.json` (Windows). Missing file falls back to
-  the placeholder. No logo is bundled.
+- Customer logo slot in the header (~40px rounded well). Click the
+  "ADD LOGO" placeholder to choose a PNG/GIF/PPM image (stdlib `PhotoImage`;
+  no Pillow). Path is persisted in `~/.config/script-grabber/ui.json`
+  (Linux/macOS) or `%APPDATA%\script-grabber\ui.json` (Windows). Missing
+  file falls back to the placeholder. No logo is bundled.
+- Visual refinement: rounded chrome on cards, the logo well, and the
+  control bar (Canvas round-rect + inner Frame, 12–16px radius, soft 2px
+  `#C5CFD4` shadow). Capture is a solid teal pill; Rescan / Apply Settings /
+  Browse are navy-outline pills. Help is a teal text link. Header is one
+  editorial line with a muted subtitle; empty state sits in a large padded
+  card; status footer is quieter. Inputs remain ttk.
 - Camera list restyled as white cards (model + serial, include checkbox,
   Exposure/Group, quieter lens row). Centered empty state when none are
   detected. Group/Lens help moved into a short hint + collapsible Help
