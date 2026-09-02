@@ -21,7 +21,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import datetime
@@ -957,9 +957,194 @@ def run_cli(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Optional Tkinter GUI: camera selection + exposure/gain + capture, in one place
 # ---------------------------------------------------------------------------
+# Visual shell is Dori-branded (navy header, teal primary, gray page, white
+# cards). Capture, grouping, PTP, lens-manifest, rescan, apply-settings, and
+# the worker-thread / ui_queue contract are unchanged.
+
+DORI_PRIMARY = "#17B696"
+DORI_NAVY = "#224C5C"
+DORI_BG = "#EAEEF0"
+DORI_TEXT = "#091116"
+DORI_LOGO = "#2E5668"
+DORI_CARD = "#FFFFFF"
+DORI_STATUS_OK = "#00695C"
+DORI_STATUS_WARN = "#FFAB40"
+DORI_STATUS_ERR = "#B71C1C"
+DORI_MUTED = "#5A6E78"
+DORI_BORDER = "#D0D7DC"
+DORI_PRIMARY_HOVER = "#129A80"
+DORI_NAVY_HOVER = "#1A3C48"
+
+
+def _ui_config_dir() -> str:
+    """User config dir for GUI prefs (logo path). Linux/mac: ~/.config or
+    $XDG_CONFIG_HOME; Windows: %APPDATA%."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "script-grabber")
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "script-grabber")
+    return os.path.join(os.path.expanduser("~"), ".config", "script-grabber")
+
+
+def _ui_prefs_path() -> str:
+    return os.path.join(_ui_config_dir(), "ui.json")
+
+
+def _load_ui_prefs() -> dict:
+    path = _ui_prefs_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ui_prefs(prefs: dict) -> None:
+    path = _ui_prefs_path()
+    try:
+        os.makedirs(_ui_config_dir(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except Exception:
+        LOG.exception("failed to write %s", path)
+
+
+def _status_annotation_color(msg: str) -> str:
+    """Map existing status strings onto Dori annotation colors. Does not
+    rewrite backend messages — only parses them."""
+    lower = (msg or "").lower()
+    if "error" in lower or "could not" in lower or "rejected" in lower:
+        return DORI_STATUS_ERR
+    if "no cameras" in lower:
+        return DORI_STATUS_WARN
+    if (
+        lower.startswith("ready")
+        or "capture complete" in lower
+        or lower.startswith("settings applied")
+        or (lower.startswith("found ") and "camera" in lower)
+    ):
+        return DORI_STATUS_OK
+    return DORI_TEXT
+
+
+def _apply_dori_theme(style, family: str) -> None:
+    """ttk Style for the Dori palette. 'clam' is the only stock theme that
+    reliably paints button backgrounds on Linux/macOS/Windows."""
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+
+    style.configure(".", background=DORI_BG, foreground=DORI_TEXT, font=(family, 11))
+    style.configure("TFrame", background=DORI_BG)
+    style.configure("TLabel", background=DORI_BG, foreground=DORI_TEXT, font=(family, 11))
+    style.configure("TCheckbutton", background=DORI_BG, foreground=DORI_TEXT, font=(family, 11))
+    style.configure(
+        "TEntry",
+        fieldbackground=DORI_CARD,
+        foreground=DORI_TEXT,
+        background=DORI_CARD,
+        bordercolor=DORI_BORDER,
+        lightcolor=DORI_BORDER,
+        darkcolor=DORI_BORDER,
+        insertcolor=DORI_TEXT,
+        padding=4,
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground=DORI_CARD,
+        background=DORI_CARD,
+        foreground=DORI_TEXT,
+        arrowcolor=DORI_NAVY,
+        bordercolor=DORI_BORDER,
+        padding=4,
+    )
+    style.map(
+        "TCombobox",
+        fieldbackground=[("readonly", DORI_CARD)],
+        foreground=[("readonly", DORI_TEXT)],
+    )
+
+    style.configure(
+        "Primary.TButton",
+        background=DORI_PRIMARY,
+        foreground="#FFFFFF",
+        bordercolor=DORI_PRIMARY,
+        darkcolor=DORI_PRIMARY,
+        lightcolor=DORI_PRIMARY,
+        focusthickness=0,
+        focuscolor=DORI_PRIMARY,
+        padding=(18, 8),
+        font=(family, 11, "bold"),
+    )
+    style.map(
+        "Primary.TButton",
+        background=[("pressed", DORI_PRIMARY_HOVER), ("active", DORI_PRIMARY_HOVER)],
+        bordercolor=[("pressed", DORI_PRIMARY_HOVER), ("active", DORI_PRIMARY_HOVER)],
+        foreground=[("disabled", DORI_BG)],
+    )
+
+    style.configure(
+        "Secondary.TButton",
+        background=DORI_NAVY,
+        foreground="#FFFFFF",
+        bordercolor=DORI_NAVY,
+        darkcolor=DORI_NAVY,
+        lightcolor=DORI_NAVY,
+        focusthickness=0,
+        focuscolor=DORI_NAVY,
+        padding=(12, 6),
+        font=(family, 11),
+    )
+    style.map(
+        "Secondary.TButton",
+        background=[("pressed", DORI_NAVY_HOVER), ("active", DORI_NAVY_HOVER)],
+        bordercolor=[("pressed", DORI_NAVY_HOVER), ("active", DORI_NAVY_HOVER)],
+        foreground=[("disabled", DORI_BG)],
+    )
+
+    style.configure(
+        "Help.TButton",
+        background=DORI_BG,
+        foreground=DORI_NAVY,
+        bordercolor=DORI_BORDER,
+        darkcolor=DORI_BG,
+        lightcolor=DORI_BG,
+        focusthickness=0,
+        focuscolor=DORI_BG,
+        padding=(8, 2),
+        font=(family, 10),
+    )
+    style.map(
+        "Help.TButton",
+        background=[("active", DORI_CARD)],
+        foreground=[("active", DORI_NAVY)],
+    )
+
+    style.configure("Card.TFrame", background=DORI_CARD)
+    style.configure("Card.TLabel", background=DORI_CARD, foreground=DORI_TEXT, font=(family, 11))
+    style.configure("CardMuted.TLabel", background=DORI_CARD, foreground=DORI_MUTED, font=(family, 10))
+    style.configure(
+        "Card.TCheckbutton",
+        background=DORI_CARD,
+        foreground=DORI_TEXT,
+        font=(family, 11, "bold"),
+        focuscolor=DORI_CARD,
+    )
+    style.map(
+        "Card.TCheckbutton",
+        background=[("active", DORI_CARD), ("selected", DORI_CARD)],
+        foreground=[("disabled", DORI_MUTED)],
+    )
+    style.configure("Bar.TLabel", background=DORI_CARD, foreground=DORI_TEXT, font=(family, 11))
+
 
 def run_gui() -> int:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import ttk, filedialog, messagebox
 
     tl_factory = pylon.TlFactory.GetInstance()
@@ -977,7 +1162,15 @@ def run_gui() -> int:
     devices = discover_or_empty()
 
     root = tk.Tk()
-    root.title(f"Basler Multi-Camera Capture v{__version__}")
+    root.title("Script Grabber")
+    root.configure(bg=DORI_BG)
+    root.minsize(780, 560)
+    root.geometry("860x620")
+
+    family = tkfont.nametofont("TkDefaultFont").actual()["family"]
+    style = ttk.Style(root)
+    _apply_dori_theme(style, family)
+
     status_var = tk.StringVar(
         value="Ready." if devices else "No cameras detected. Connect a camera and click Rescan."
     )
@@ -991,8 +1184,100 @@ def run_gui() -> int:
     lens_brand_vars = []
     lens_model_vars = []
 
-    cams_frame = ttk.Frame(root)
-    cams_frame.pack(fill="x", padx=8, pady=8)
+    # --- Header (navy) + teal accent ---------------------------------------
+    header = tk.Frame(root, bg=DORI_NAVY)
+    header.pack(fill="x")
+
+    title_col = tk.Frame(header, bg=DORI_NAVY)
+    title_col.pack(side="left", padx=20, pady=12)
+    tk.Label(
+        title_col, text="Script Grabber", bg=DORI_NAVY, fg="#FFFFFF",
+        font=(family, 16, "bold"),
+    ).pack(anchor="w")
+    tk.Label(
+        title_col, text=f"v{__version__}", bg=DORI_NAVY, fg="#EAEEF0",
+        font=(family, 10),
+    ).pack(anchor="w")
+
+    logo_slot = tk.Frame(header, bg=DORI_NAVY)
+    logo_slot.pack(side="right", padx=16, pady=8)
+    logo_photo = [None]  # PhotoImage must be held or Tk garbage-collects it
+
+    def choose_logo(_event=None):
+        path = filedialog.askopenfilename(
+            title="Choose customer logo",
+            filetypes=[
+                ("PNG, GIF, PPM", "*.png *.gif *.ppm *.pgm"),
+                ("PNG", "*.png"),
+                ("GIF", "*.gif"),
+                ("PPM / PGM", "*.ppm *.pgm"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            tk.PhotoImage(file=path)
+        except Exception as e:
+            messagebox.showwarning(
+                "Unsupported image",
+                "Could not load that file with Tk PhotoImage.\n"
+                "Use PNG, GIF, or PPM/PGM (no JPEG unless Tk was built with it).\n\n"
+                f"{e}",
+            )
+            return
+        prefs = _load_ui_prefs()
+        prefs["customer_logo_path"] = path
+        _save_ui_prefs(prefs)
+        refresh_logo()
+
+    def refresh_logo():
+        for child in logo_slot.winfo_children():
+            child.destroy()
+        logo_photo[0] = None
+        path = (_load_ui_prefs().get("customer_logo_path") or "").strip()
+        img = None
+        if path and os.path.isfile(path):
+            try:
+                img = tk.PhotoImage(file=path)
+                h, w = img.height(), img.width()
+                factor = 1
+                while factor < 32 and (h // factor > 48 or w // factor > 180):
+                    factor += 1
+                if factor > 1:
+                    img = img.subsample(factor, factor)
+            except Exception:
+                img = None
+        if img is not None:
+            logo_photo[0] = img
+            lbl = tk.Label(logo_slot, image=img, bg=DORI_NAVY, cursor="hand2")
+            lbl.pack()
+            lbl.bind("<Button-1>", choose_logo)
+            return
+        ph = tk.Frame(
+            logo_slot, bg=DORI_NAVY, cursor="hand2",
+            highlightbackground=DORI_LOGO, highlightthickness=1,
+            width=148, height=44,
+        )
+        ph.pack()
+        ph.pack_propagate(False)
+        lab = tk.Label(
+            ph, text="Customer logo", bg=DORI_NAVY, fg=DORI_LOGO,
+            font=(family, 9), cursor="hand2",
+        )
+        lab.place(relx=0.5, rely=0.5, anchor="center")
+        ph.bind("<Button-1>", choose_logo)
+        lab.bind("<Button-1>", choose_logo)
+
+    refresh_logo()
+
+    tk.Frame(root, bg=DORI_PRIMARY, height=2).pack(fill="x")
+
+    content = tk.Frame(root, bg=DORI_BG)
+    content.pack(fill="both", expand=True, padx=20, pady=16)
+
+    cams_frame = tk.Frame(content, bg=DORI_BG)
+    cams_frame.pack(fill="both", expand=True)
 
     def build_camera_rows():
         # Rebuildable so Rescan can pick up cameras connected after the
@@ -1012,71 +1297,115 @@ def run_gui() -> int:
         lens_model_vars.clear()
 
         if not devices:
-            ttk.Label(
-                cams_frame,
-                text="No cameras detected. Connect a camera and click Rescan.",
-            ).pack(anchor="w", padx=4, pady=4)
+            empty = tk.Frame(cams_frame, bg=DORI_BG)
+            empty.pack(fill="both", expand=True, pady=36)
+            tk.Label(
+                empty, text="No cameras detected", bg=DORI_BG, fg=DORI_NAVY,
+                font=(family, 14, "bold"),
+            ).pack()
+            tk.Label(
+                empty,
+                text="Connect or power on a camera, then click Rescan.",
+                bg=DORI_BG, fg=DORI_MUTED, font=(family, 11),
+            ).pack(pady=(8, 0))
             return
 
         for i, d in enumerate(devices):
-            block = ttk.Frame(cams_frame)
-            block.pack(fill="x", pady=(2, 6))
+            card = tk.Frame(
+                cams_frame, bg=DORI_CARD,
+                highlightbackground=DORI_BORDER, highlightthickness=1, bd=0,
+            )
+            card.pack(fill="x", pady=(0, 8))
+            inner = tk.Frame(card, bg=DORI_CARD)
+            inner.pack(fill="x", padx=14, pady=10)
 
-            row = ttk.Frame(block)
-            row.pack(fill="x")
+            top = tk.Frame(inner, bg=DORI_CARD)
+            top.pack(fill="x")
             v = tk.BooleanVar(value=True)
             cam_vars.append(v)
-            ttk.Checkbutton(row, text=f"{d.GetModelName()} (S/N {d.GetSerialNumber()})",
-                             variable=v).pack(side="left")
+            ttk.Checkbutton(
+                top, text=d.GetModelName(), variable=v, style="Card.TCheckbutton",
+            ).pack(side="left")
+            ttk.Label(
+                top, text=f"S/N {d.GetSerialNumber()}", style="CardMuted.TLabel",
+            ).pack(side="left", padx=(10, 0))
 
             exp_var = tk.StringVar()
             exposure_vars.append(exp_var)
-            ttk.Label(row, text="Exposure (us):").pack(side="left", padx=(12, 0))
-            ttk.Entry(row, textvariable=exp_var, width=10).pack(side="left")
+            group_var = tk.StringVar()
+            group_vars.append(group_var)
 
+            mid = tk.Frame(inner, bg=DORI_CARD)
+            mid.pack(fill="x", pady=(8, 0))
+            ttk.Label(mid, text="Exposure (us):", style="Card.TLabel").pack(side="left")
+            ttk.Entry(mid, textvariable=exp_var, width=10).pack(side="left", padx=(6, 0))
             # Blank by default — collision-free (no shared implicit label
             # like str(i) could accidentally pull two rows into the same
             # group) and means "capture on its own," identical to today's
             # behavior with zero user interaction.
-            group_var = tk.StringVar()
-            group_vars.append(group_var)
-            ttk.Label(row, text="Group:").pack(side="left", padx=(8, 0))
-            ttk.Entry(row, textvariable=group_var, width=4).pack(side="left")
+            ttk.Label(mid, text="Group:", style="Card.TLabel").pack(side="left", padx=(16, 0))
+            ttk.Entry(mid, textvariable=group_var, width=6).pack(side="left", padx=(6, 0))
 
-            # Second, indented sub-row: lens info — pure session
-            # documentation, never written to the camera. Kept on its own
-            # line rather than appended to `row` so the camera list stays
-            # scannable rather than growing into one very wide row per
-            # camera.
-            lens_row = ttk.Frame(block)
-            lens_row.pack(fill="x", padx=(24, 0), pady=(1, 0))
+            # Second, quieter sub-row: lens info — pure session
+            # documentation, never written to the camera.
+            lens_row = tk.Frame(inner, bg=DORI_CARD)
+            lens_row.pack(fill="x", pady=(6, 0))
             lens_mm_var = tk.StringVar()
             lens_brand_var = tk.StringVar()
             lens_model_var = tk.StringVar()
             lens_mm_vars.append(lens_mm_var)
             lens_brand_vars.append(lens_brand_var)
             lens_model_vars.append(lens_model_var)
-            ttk.Label(lens_row, text="Lens (mm):").pack(side="left")
-            ttk.Entry(lens_row, textvariable=lens_mm_var, width=6).pack(side="left")
-            ttk.Label(lens_row, text="Brand:").pack(side="left", padx=(8, 0))
-            ttk.Entry(lens_row, textvariable=lens_brand_var, width=10).pack(side="left")
-            ttk.Label(lens_row, text="Model (optional):").pack(side="left", padx=(8, 0))
-            ttk.Entry(lens_row, textvariable=lens_model_var, width=14).pack(side="left")
+            ttk.Label(lens_row, text="Lens (mm):", style="CardMuted.TLabel").pack(side="left")
+            ttk.Entry(lens_row, textvariable=lens_mm_var, width=6).pack(side="left", padx=(6, 0))
+            ttk.Label(lens_row, text="Brand:", style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
+            ttk.Entry(lens_row, textvariable=lens_brand_var, width=10).pack(side="left", padx=(6, 0))
+            ttk.Label(lens_row, text="Model (optional):", style="CardMuted.TLabel").pack(
+                side="left", padx=(12, 0)
+            )
+            ttk.Entry(lens_row, textvariable=lens_model_var, width=14).pack(side="left", padx=(6, 0))
 
     build_camera_rows()
 
-    ttk.Label(
-        root,
+    hint_row = tk.Frame(content, bg=DORI_BG)
+    hint_row.pack(fill="x", pady=(4, 0))
+    tk.Label(
+        hint_row,
+        text="Same Group value = hardware-synced capture into one folder.  "
+             "Lens fields are session notes only.",
+        bg=DORI_BG, fg=DORI_MUTED, font=(family, 10), anchor="w", justify="left",
+    ).pack(side="left", fill="x", expand=True)
+    help_visible = [False]
+    help_body = tk.Frame(content, bg=DORI_BG)
+
+    def toggle_help():
+        help_visible[0] = not help_visible[0]
+        if help_visible[0]:
+            help_body.pack(fill="x", pady=(6, 0), after=hint_row)
+            help_btn.configure(text="Help ▾")
+        else:
+            help_body.pack_forget()
+            help_btn.configure(text="Help ▸")
+
+    help_btn = ttk.Button(hint_row, text="Help ▸", command=toggle_help, style="Help.TButton")
+    help_btn.pack(side="right")
+
+    tk.Label(
+        help_body,
         text="Group: cameras sharing the same Group value fire together "
              "(hardware-synced) and save into one shared folder. Leave blank "
              "to capture that camera on its own, as today.",
-    ).pack(fill="x", padx=8, pady=(0, 4))
-    ttk.Label(
-        root,
+        bg=DORI_BG, fg=DORI_TEXT, font=(family, 10), wraplength=780, justify="left",
+        anchor="w",
+    ).pack(fill="x", pady=(0, 4))
+    tk.Label(
+        help_body,
         text="Lens (mm)/Brand/Model: session documentation only, saved "
              "alongside the images — never written to the camera. All three "
              "fields may be left blank.",
-    ).pack(fill="x", padx=8, pady=(0, 4))
+        bg=DORI_BG, fg=DORI_TEXT, font=(family, 10), wraplength=780, justify="left",
+        anchor="w",
+    ).pack(fill="x")
 
     def _read_first(cam, names, default=""):
         for n in names:
@@ -1148,22 +1477,9 @@ def run_gui() -> int:
                     cam.Close()
         status_var.set("Settings applied.")
 
-    bottom = ttk.Frame(root)
-    bottom.pack(fill="x", padx=8, pady=(0, 8))
     count_var = tk.IntVar(value=10)
     fmt_var = tk.StringVar(value="tiff")
     outdir_var = tk.StringVar(value=os.path.abspath("./captures"))
-
-    ttk.Label(bottom, text="Count:").pack(side="left")
-    ttk.Entry(bottom, textvariable=count_var, width=6).pack(side="left")
-    ttk.Label(bottom, text="Format:").pack(side="left", padx=(8, 0))
-    ttk.OptionMenu(bottom, fmt_var, "tiff", "tiff", "png", "bmp").pack(side="left")
-    ttk.Button(
-        bottom, text="Browse...",
-        command=lambda: outdir_var.set(filedialog.askdirectory() or outdir_var.get()),
-    ).pack(side="left", padx=(8, 0))
-
-    ttk.Label(root, textvariable=status_var).pack(fill="x", padx=8, pady=(0, 4))
 
     # Capture runs in a worker thread; Tk widgets must only ever be touched
     # from the main thread, so the worker pushes status strings onto a queue
@@ -1279,9 +1595,59 @@ def run_gui() -> int:
         else:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
 
-    ttk.Button(bottom, text="Rescan", command=rescan).pack(side="left", padx=(8, 0))
-    ttk.Button(bottom, text="Apply Settings", command=apply_settings).pack(side="left", padx=(8, 0))
-    ttk.Button(bottom, text="Capture", command=start_capture).pack(side="left", padx=(8, 0))
+    bar = tk.Frame(
+        root, bg=DORI_CARD,
+        highlightbackground=DORI_BORDER, highlightthickness=1, bd=0,
+    )
+    bar.pack(fill="x", padx=20, pady=(0, 8))
+    bar_inner = tk.Frame(bar, bg=DORI_CARD)
+    bar_inner.pack(fill="x", padx=14, pady=12)
+
+    row1 = tk.Frame(bar_inner, bg=DORI_CARD)
+    row1.pack(fill="x")
+    ttk.Label(row1, text="Count:", style="Bar.TLabel").pack(side="left")
+    ttk.Entry(row1, textvariable=count_var, width=6).pack(side="left", padx=(6, 0))
+    ttk.Label(row1, text="Format:", style="Bar.TLabel").pack(side="left", padx=(14, 0))
+    ttk.Combobox(
+        row1, textvariable=fmt_var, values=("tiff", "png", "bmp"),
+        state="readonly", width=8,
+    ).pack(side="left", padx=(6, 0))
+    ttk.Label(row1, text="Folder:", style="Bar.TLabel").pack(side="left", padx=(14, 0))
+    ttk.Entry(row1, textvariable=outdir_var).pack(side="left", fill="x", expand=True, padx=(6, 8))
+    ttk.Button(
+        row1, text="Browse", style="Secondary.TButton",
+        command=lambda: outdir_var.set(filedialog.askdirectory() or outdir_var.get()),
+    ).pack(side="left")
+
+    row2 = tk.Frame(bar_inner, bg=DORI_CARD)
+    row2.pack(fill="x", pady=(10, 0))
+    ttk.Button(row2, text="Capture", style="Primary.TButton", command=start_capture).pack(side="right")
+    ttk.Button(row2, text="Apply Settings", style="Secondary.TButton", command=apply_settings).pack(
+        side="right", padx=(0, 8)
+    )
+    ttk.Button(row2, text="Rescan", style="Secondary.TButton", command=rescan).pack(
+        side="right", padx=(0, 8)
+    )
+
+    status_row = tk.Frame(root, bg=DORI_BG)
+    status_row.pack(fill="x", padx=20, pady=(0, 16))
+    status_label = tk.Label(
+        status_row, textvariable=status_var, anchor="w", justify="left",
+        bg=DORI_BG, fg=_status_annotation_color(status_var.get()),
+        font=(family, 11), wraplength=800,
+    )
+    status_label.pack(fill="x")
+
+    def _on_status_write(*_args):
+        status_label.configure(foreground=_status_annotation_color(status_var.get()))
+
+    status_var.trace_add("write", _on_status_write)
+
+    def _on_root_configure(event):
+        if event.widget is root:
+            status_label.configure(wraplength=max(event.width - 56, 200))
+
+    root.bind("<Configure>", _on_root_configure)
 
     load_current_settings()
     poll_queue()
