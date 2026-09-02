@@ -958,8 +958,8 @@ def run_cli(args: argparse.Namespace) -> int:
 # Optional Tkinter GUI: camera selection + exposure/gain + capture, in one place
 # ---------------------------------------------------------------------------
 # Visual shell is Dori-branded (navy header, teal primary, gray page, white
-# cards). Capture, grouping, PTP, lens-manifest, rescan, apply-settings, and
-# the worker-thread / ui_queue contract are unchanged.
+# rounded cards with pill controls). Capture, grouping, PTP, lens-manifest,
+# rescan, apply-settings, and the worker-thread / ui_queue contract are unchanged.
 
 DORI_PRIMARY = "#17B696"
 DORI_NAVY = "#224C5C"
@@ -974,6 +974,41 @@ DORI_MUTED = "#5A6E78"
 DORI_BORDER = "#D0D7DC"
 DORI_PRIMARY_HOVER = "#129A80"
 DORI_NAVY_HOVER = "#1A3C48"
+DORI_SHADOW = "#C5CFD4"
+DORI_SUBTITLE = "#9BB4BC"
+DORI_LOGO_WELL = "#1A3A46"
+
+_UI_FONT_CANDIDATES = (
+    "Helvetica Neue",
+    ".AppleSystemUIFont",
+    "SF Pro Text",
+    "Segoe UI",
+    "Helvetica",
+)
+
+
+def _ui_font_family(tkfont) -> str:
+    """Prefer a clean UI face; fall back to Tk's default if none are present."""
+    available = set(tkfont.families())
+    for name in _UI_FONT_CANDIDATES:
+        if name in available:
+            return name
+    return tkfont.nametofont("TkDefaultFont").actual()["family"]
+
+
+def _round_rect_coords(x1, y1, x2, y2, r):
+    r = max(0.0, min(float(r), abs(x2 - x1) / 2.0, abs(y2 - y1) / 2.0))
+    return (
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    )
+
+
+def _canvas_round_rect(canvas, x1, y1, x2, y2, r, **kwargs):
+    return canvas.create_polygon(
+        _round_rect_coords(x1, y1, x2, y2, r), smooth=True, **kwargs,
+    )
 
 
 def _ui_config_dir() -> str:
@@ -1031,8 +1066,9 @@ def _status_annotation_color(msg: str) -> str:
 
 
 def _apply_dori_theme(style, family: str) -> None:
-    """ttk Style for the Dori palette. 'clam' is the only stock theme that
-    reliably paints button backgrounds on Linux/macOS/Windows."""
+    """ttk Style for inputs, labels, and checkbuttons. Buttons are Canvas
+    pills drawn separately — 'clam' still gives Entry/Combobox a paintable
+    field background on Linux/macOS/Windows."""
     try:
         style.theme_use("clam")
     except Exception:
@@ -1051,7 +1087,7 @@ def _apply_dori_theme(style, family: str) -> None:
         lightcolor=DORI_BORDER,
         darkcolor=DORI_BORDER,
         insertcolor=DORI_TEXT,
-        padding=4,
+        padding=6,
     )
     style.configure(
         "TCombobox",
@@ -1060,68 +1096,13 @@ def _apply_dori_theme(style, family: str) -> None:
         foreground=DORI_TEXT,
         arrowcolor=DORI_NAVY,
         bordercolor=DORI_BORDER,
-        padding=4,
+        padding=6,
     )
     style.map(
         "TCombobox",
         fieldbackground=[("readonly", DORI_CARD)],
         foreground=[("readonly", DORI_TEXT)],
-    )
-
-    style.configure(
-        "Primary.TButton",
-        background=DORI_PRIMARY,
-        foreground="#FFFFFF",
-        bordercolor=DORI_PRIMARY,
-        darkcolor=DORI_PRIMARY,
-        lightcolor=DORI_PRIMARY,
-        focusthickness=0,
-        focuscolor=DORI_PRIMARY,
-        padding=(18, 8),
-        font=(family, 11, "bold"),
-    )
-    style.map(
-        "Primary.TButton",
-        background=[("pressed", DORI_PRIMARY_HOVER), ("active", DORI_PRIMARY_HOVER)],
-        bordercolor=[("pressed", DORI_PRIMARY_HOVER), ("active", DORI_PRIMARY_HOVER)],
-        foreground=[("disabled", DORI_BG)],
-    )
-
-    style.configure(
-        "Secondary.TButton",
-        background=DORI_NAVY,
-        foreground="#FFFFFF",
-        bordercolor=DORI_NAVY,
-        darkcolor=DORI_NAVY,
-        lightcolor=DORI_NAVY,
-        focusthickness=0,
-        focuscolor=DORI_NAVY,
-        padding=(12, 6),
-        font=(family, 11),
-    )
-    style.map(
-        "Secondary.TButton",
-        background=[("pressed", DORI_NAVY_HOVER), ("active", DORI_NAVY_HOVER)],
-        bordercolor=[("pressed", DORI_NAVY_HOVER), ("active", DORI_NAVY_HOVER)],
-        foreground=[("disabled", DORI_BG)],
-    )
-
-    style.configure(
-        "Help.TButton",
-        background=DORI_BG,
-        foreground=DORI_NAVY,
-        bordercolor=DORI_BORDER,
-        darkcolor=DORI_BG,
-        lightcolor=DORI_BG,
-        focusthickness=0,
-        focuscolor=DORI_BG,
-        padding=(8, 2),
-        font=(family, 10),
-    )
-    style.map(
-        "Help.TButton",
-        background=[("active", DORI_CARD)],
-        foreground=[("active", DORI_NAVY)],
+        bordercolor=[("focus", DORI_NAVY), ("readonly", DORI_BORDER)],
     )
 
     style.configure("Card.TFrame", background=DORI_CARD)
@@ -1131,7 +1112,7 @@ def _apply_dori_theme(style, family: str) -> None:
         "Card.TCheckbutton",
         background=DORI_CARD,
         foreground=DORI_TEXT,
-        font=(family, 11, "bold"),
+        font=(family, 11),
         focuscolor=DORI_CARD,
     )
     style.map(
@@ -1139,7 +1120,7 @@ def _apply_dori_theme(style, family: str) -> None:
         background=[("active", DORI_CARD), ("selected", DORI_CARD)],
         foreground=[("disabled", DORI_MUTED)],
     )
-    style.configure("Bar.TLabel", background=DORI_CARD, foreground=DORI_TEXT, font=(family, 11))
+    style.configure("Bar.TLabel", background=DORI_CARD, foreground=DORI_MUTED, font=(family, 8))
 
 
 def run_gui() -> int:
@@ -1164,12 +1145,93 @@ def run_gui() -> int:
     root = tk.Tk()
     root.title("Script Grabber")
     root.configure(bg=DORI_BG)
-    root.minsize(780, 560)
-    root.geometry("860x620")
+    root.minsize(820, 600)
+    root.geometry("900x640")
 
-    family = tkfont.nametofont("TkDefaultFont").actual()["family"]
+    family = _ui_font_family(tkfont)
     style = ttk.Style(root)
     _apply_dori_theme(style, family)
+    title_font = tkfont.Font(family=family, size=18, weight="normal")
+    subtitle_font = tkfont.Font(family=family, size=11, weight="normal")
+    caps_font = tkfont.Font(family=family, size=8, weight="normal")
+    pill_font = tkfont.Font(family=family, size=11, weight="normal")
+    link_font = tkfont.Font(family=family, size=11, weight="normal", underline=False)
+    link_font_hover = tkfont.Font(family=family, size=11, weight="normal", underline=True)
+    status_font = tkfont.Font(family=family, size=9, weight="normal")
+
+    def _rounded_panel(parent, fill=DORI_CARD, radius=14, shadow=True, canvas_bg=None):
+        """Canvas round-rect chrome + inner Frame. Returns (outer, inner)."""
+        bg = canvas_bg if canvas_bg is not None else parent.cget("bg")
+        outer = tk.Frame(parent, bg=bg)
+        canvas = tk.Canvas(outer, bg=bg, highlightthickness=0, bd=0)
+        canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        inner = tk.Frame(outer, bg=fill)
+        off = 2 if shadow else 0
+        inset = max(6, int(radius * 0.35))
+        inner.pack(
+            fill="both", expand=True,
+            padx=(inset, inset + off), pady=(inset, inset + off),
+        )
+
+        def _redraw(event):
+            if event.widget is not outer:
+                return
+            w, h = event.width, event.height
+            canvas.delete("chrome")
+            if w < 8 or h < 8:
+                return
+            if shadow:
+                _canvas_round_rect(
+                    canvas, off, off, w, h, radius,
+                    fill=DORI_SHADOW, outline="", tags="chrome",
+                )
+            _canvas_round_rect(
+                canvas, 0, 0, max(w - off, 1), max(h - off, 1), radius,
+                fill=fill, outline="", tags="chrome",
+            )
+            canvas.lower()
+
+        outer.bind("<Configure>", _redraw)
+        return outer, inner
+
+    def _pill_button(parent, text, command, kind="outline", canvas_bg=None):
+        """Canvas pill: solid teal Capture, or navy-outline secondary."""
+        bg = canvas_bg if canvas_bg is not None else parent.cget("bg")
+        pad_x = 20 if kind == "solid" else 16
+        pad_y = 8 if kind == "solid" else 7
+        tw = pill_font.measure(text)
+        th = pill_font.metrics("linespace")
+        w = max(int(tw + pad_x * 2), 92)
+        h = int(th + pad_y * 2)
+        r = h / 2.0
+        cnv = tk.Canvas(
+            parent, width=w, height=h, bg=bg,
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        hover = [False]
+
+        def draw(_event=None):
+            cnv.delete("all")
+            if kind == "solid":
+                fill = DORI_PRIMARY_HOVER if hover[0] else DORI_PRIMARY
+                _canvas_round_rect(cnv, 0, 0, w, h, r, fill=fill, outline="")
+                cnv.create_text(w / 2, h / 2, text=text, fill="#FFFFFF", font=pill_font)
+            else:
+                fill = "#F3F6F7" if hover[0] else DORI_CARD
+                _canvas_round_rect(
+                    cnv, 0.5, 0.5, w - 0.5, h - 0.5, r, fill=DORI_NAVY, outline="",
+                )
+                _canvas_round_rect(
+                    cnv, 1.8, 1.8, w - 1.8, h - 1.8, max(r - 1.6, 1),
+                    fill=fill, outline="",
+                )
+                cnv.create_text(w / 2, h / 2, text=text, fill=DORI_NAVY, font=pill_font)
+
+        cnv.bind("<Enter>", lambda _e: (hover.__setitem__(0, True), draw()))
+        cnv.bind("<Leave>", lambda _e: (hover.__setitem__(0, False), draw()))
+        cnv.bind("<Button-1>", lambda _e: command())
+        draw()
+        return cnv
 
     status_var = tk.StringVar(
         value="Ready." if devices else "No cameras detected. Connect a camera and click Rescan."
@@ -1184,24 +1246,25 @@ def run_gui() -> int:
     lens_brand_vars = []
     lens_model_vars = []
 
-    # --- Header (navy) + teal accent ---------------------------------------
+    # --- Header (navy) + hairline teal accent ------------------------------
     header = tk.Frame(root, bg=DORI_NAVY)
     header.pack(fill="x")
 
-    title_col = tk.Frame(header, bg=DORI_NAVY)
-    title_col.pack(side="left", padx=20, pady=12)
+    title_row = tk.Frame(header, bg=DORI_NAVY)
+    title_row.pack(side="left", padx=28, pady=16)
     tk.Label(
-        title_col, text="Script Grabber", bg=DORI_NAVY, fg="#FFFFFF",
-        font=(family, 16, "bold"),
-    ).pack(anchor="w")
+        title_row, text="Script Grabber", bg=DORI_NAVY, fg="#FFFFFF",
+        font=title_font,
+    ).pack(side="left")
     tk.Label(
-        title_col, text=f"v{__version__}", bg=DORI_NAVY, fg="#EAEEF0",
-        font=(family, 10),
-    ).pack(anchor="w")
+        title_row, text=f"Multi-camera capture  ·  v{__version__}",
+        bg=DORI_NAVY, fg=DORI_SUBTITLE, font=subtitle_font,
+    ).pack(side="left", padx=(14, 0), pady=(3, 0))
 
     logo_slot = tk.Frame(header, bg=DORI_NAVY)
-    logo_slot.pack(side="right", padx=16, pady=8)
+    logo_slot.pack(side="right", padx=24, pady=12)
     logo_photo = [None]  # PhotoImage must be held or Tk garbage-collects it
+    LOGO_WELL_W, LOGO_WELL_H, LOGO_WELL_R = 128, 40, 12
 
     def choose_logo(_event=None):
         path = filedialog.askopenfilename(
@@ -1242,39 +1305,37 @@ def run_gui() -> int:
                 img = tk.PhotoImage(file=path)
                 h, w = img.height(), img.width()
                 factor = 1
-                while factor < 32 and (h // factor > 48 or w // factor > 180):
+                while factor < 32 and (h // factor > 28 or w // factor > 108):
                     factor += 1
                 if factor > 1:
                     img = img.subsample(factor, factor)
             except Exception:
                 img = None
+        well = tk.Canvas(
+            logo_slot, width=LOGO_WELL_W, height=LOGO_WELL_H,
+            bg=DORI_NAVY, highlightthickness=0, bd=0, cursor="hand2",
+        )
+        well.pack()
+        _canvas_round_rect(
+            well, 0, 0, LOGO_WELL_W, LOGO_WELL_H, LOGO_WELL_R,
+            fill=DORI_LOGO_WELL, outline="",
+        )
         if img is not None:
             logo_photo[0] = img
-            lbl = tk.Label(logo_slot, image=img, bg=DORI_NAVY, cursor="hand2")
-            lbl.pack()
-            lbl.bind("<Button-1>", choose_logo)
-            return
-        ph = tk.Frame(
-            logo_slot, bg=DORI_NAVY, cursor="hand2",
-            highlightbackground=DORI_LOGO, highlightthickness=1,
-            width=148, height=44,
-        )
-        ph.pack()
-        ph.pack_propagate(False)
-        lab = tk.Label(
-            ph, text="Customer logo", bg=DORI_NAVY, fg=DORI_LOGO,
-            font=(family, 9), cursor="hand2",
-        )
-        lab.place(relx=0.5, rely=0.5, anchor="center")
-        ph.bind("<Button-1>", choose_logo)
-        lab.bind("<Button-1>", choose_logo)
+            well.create_image(LOGO_WELL_W / 2, LOGO_WELL_H / 2, image=img)
+        else:
+            well.create_text(
+                LOGO_WELL_W / 2, LOGO_WELL_H / 2,
+                text="ADD LOGO", fill=DORI_LOGO, font=caps_font,
+            )
+        well.bind("<Button-1>", choose_logo)
 
     refresh_logo()
 
     tk.Frame(root, bg=DORI_PRIMARY, height=2).pack(fill="x")
 
     content = tk.Frame(root, bg=DORI_BG)
-    content.pack(fill="both", expand=True, padx=20, pady=16)
+    content.pack(fill="both", expand=True, padx=28, pady=(20, 16))
 
     cams_frame = tk.Frame(content, bg=DORI_BG)
     cams_frame.pack(fill="both", expand=True)
@@ -1297,27 +1358,31 @@ def run_gui() -> int:
         lens_model_vars.clear()
 
         if not devices:
-            empty = tk.Frame(cams_frame, bg=DORI_BG)
-            empty.pack(fill="both", expand=True, pady=36)
+            empty_outer, empty_inner = _rounded_panel(
+                cams_frame, fill=DORI_CARD, radius=16, shadow=True,
+            )
+            empty_outer.pack(fill="both", expand=True, pady=(0, 4))
+            empty_inner.grid_rowconfigure(0, weight=1)
+            empty_inner.grid_columnconfigure(0, weight=1)
+            empty_body = tk.Frame(empty_inner, bg=DORI_CARD)
+            empty_body.grid(row=0, column=0, padx=48, pady=48)
             tk.Label(
-                empty, text="No cameras detected", bg=DORI_BG, fg=DORI_NAVY,
-                font=(family, 14, "bold"),
+                empty_body, text="No cameras yet", bg=DORI_CARD, fg=DORI_NAVY,
+                font=(family, 13),
             ).pack()
             tk.Label(
-                empty,
-                text="Connect or power on a camera, then click Rescan.",
-                bg=DORI_BG, fg=DORI_MUTED, font=(family, 11),
+                empty_body,
+                text="They will appear here when a Basler camera is on the network.",
+                bg=DORI_CARD, fg=DORI_MUTED, font=(family, 11),
             ).pack(pady=(8, 0))
             return
 
         for i, d in enumerate(devices):
-            card = tk.Frame(
-                cams_frame, bg=DORI_CARD,
-                highlightbackground=DORI_BORDER, highlightthickness=1, bd=0,
+            card, inner = _rounded_panel(
+                cams_frame, fill=DORI_CARD, radius=14, shadow=True,
             )
-            card.pack(fill="x", pady=(0, 8))
-            inner = tk.Frame(card, bg=DORI_CARD)
-            inner.pack(fill="x", padx=14, pady=10)
+            card.pack(fill="x", pady=(0, 10))
+            inner.pack_configure(padx=(16, 18), pady=(12, 14))
 
             top = tk.Frame(inner, bg=DORI_CARD)
             top.pack(fill="x")
@@ -1378,34 +1443,45 @@ def run_gui() -> int:
     help_visible = [False]
     help_body = tk.Frame(content, bg=DORI_BG)
 
-    def toggle_help():
+    def toggle_help(_event=None):
         help_visible[0] = not help_visible[0]
         if help_visible[0]:
             help_body.pack(fill="x", pady=(6, 0), after=hint_row)
-            help_btn.configure(text="Help ▾")
+            help_link.configure(text="Help ▾")
         else:
             help_body.pack_forget()
-            help_btn.configure(text="Help ▸")
+            help_link.configure(text="Help")
 
-    help_btn = ttk.Button(hint_row, text="Help ▸", command=toggle_help, style="Help.TButton")
-    help_btn.pack(side="right")
+    help_link = tk.Label(
+        hint_row, text="Help", bg=DORI_BG, fg=DORI_PRIMARY,
+        font=link_font, cursor="hand2",
+    )
+    help_link.pack(side="right", padx=(12, 0))
+    help_link.bind("<Button-1>", toggle_help)
+    help_link.bind("<Enter>", lambda _e: help_link.configure(font=link_font_hover))
+    help_link.bind("<Leave>", lambda _e: help_link.configure(font=link_font))
 
-    tk.Label(
-        help_body,
-        text="Group: cameras sharing the same Group value fire together "
-             "(hardware-synced) and save into one shared folder. Leave blank "
-             "to capture that camera on its own, as today.",
-        bg=DORI_BG, fg=DORI_TEXT, font=(family, 10), wraplength=780, justify="left",
-        anchor="w",
-    ).pack(fill="x", pady=(0, 4))
-    tk.Label(
-        help_body,
-        text="Lens (mm)/Brand/Model: session documentation only, saved "
-             "alongside the images — never written to the camera. All three "
-             "fields may be left blank.",
-        bg=DORI_BG, fg=DORI_TEXT, font=(family, 10), wraplength=780, justify="left",
-        anchor="w",
-    ).pack(fill="x")
+    help_labels = []
+    for i, (txt, extra_pady) in enumerate((
+        (
+            "Group: cameras sharing the same Group value fire together "
+            "(hardware-synced) and save into one shared folder. Leave blank "
+            "to capture that camera on its own, as today.",
+            (0, 4),
+        ),
+        (
+            "Lens (mm)/Brand/Model: session documentation only, saved "
+            "alongside the images — never written to the camera. All three "
+            "fields may be left blank.",
+            (0, 0),
+        ),
+    )):
+        lab = tk.Label(
+            help_body, text=txt, bg=DORI_BG, fg=DORI_MUTED,
+            font=(family, 10), wraplength=760, justify="left", anchor="w",
+        )
+        lab.pack(fill="x", pady=extra_pady)
+        help_labels.append(lab)
 
     def _read_first(cam, names, default=""):
         for n in names:
@@ -1595,46 +1671,56 @@ def run_gui() -> int:
         else:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
 
-    bar = tk.Frame(
-        root, bg=DORI_CARD,
-        highlightbackground=DORI_BORDER, highlightthickness=1, bd=0,
+    bar, bar_inner = _rounded_panel(
+        root, fill=DORI_CARD, radius=16, shadow=True, canvas_bg=DORI_BG,
     )
-    bar.pack(fill="x", padx=20, pady=(0, 8))
-    bar_inner = tk.Frame(bar, bg=DORI_CARD)
-    bar_inner.pack(fill="x", padx=14, pady=12)
+    bar.pack(fill="x", padx=28, pady=(0, 8))
+    bar_pad = tk.Frame(bar_inner, bg=DORI_CARD)
+    bar_pad.pack(fill="x", padx=12, pady=10)
 
-    row1 = tk.Frame(bar_inner, bg=DORI_CARD)
+    row1 = tk.Frame(bar_pad, bg=DORI_CARD)
     row1.pack(fill="x")
-    ttk.Label(row1, text="Count:", style="Bar.TLabel").pack(side="left")
-    ttk.Entry(row1, textvariable=count_var, width=6).pack(side="left", padx=(6, 0))
-    ttk.Label(row1, text="Format:", style="Bar.TLabel").pack(side="left", padx=(14, 0))
+
+    def _caps(parent, text):
+        return tk.Label(
+            parent, text=text, bg=DORI_CARD, fg=DORI_MUTED, font=caps_font,
+        )
+
+    _caps(row1, "COUNT").pack(side="left")
+    ttk.Entry(row1, textvariable=count_var, width=6).pack(side="left", padx=(8, 0))
+    _caps(row1, "FORMAT").pack(side="left", padx=(20, 0))
     ttk.Combobox(
         row1, textvariable=fmt_var, values=("tiff", "png", "bmp"),
         state="readonly", width=8,
-    ).pack(side="left", padx=(6, 0))
-    ttk.Label(row1, text="Folder:", style="Bar.TLabel").pack(side="left", padx=(14, 0))
-    ttk.Entry(row1, textvariable=outdir_var).pack(side="left", fill="x", expand=True, padx=(6, 8))
-    ttk.Button(
-        row1, text="Browse", style="Secondary.TButton",
-        command=lambda: outdir_var.set(filedialog.askdirectory() or outdir_var.get()),
+    ).pack(side="left", padx=(8, 0))
+    _caps(row1, "FOLDER").pack(side="left", padx=(20, 0))
+    ttk.Entry(row1, textvariable=outdir_var).pack(
+        side="left", fill="x", expand=True, padx=(8, 10),
+    )
+    _pill_button(
+        row1, "Browse",
+        lambda: outdir_var.set(filedialog.askdirectory() or outdir_var.get()),
+        kind="outline", canvas_bg=DORI_CARD,
     ).pack(side="left")
 
-    row2 = tk.Frame(bar_inner, bg=DORI_CARD)
-    row2.pack(fill="x", pady=(10, 0))
-    ttk.Button(row2, text="Capture", style="Primary.TButton", command=start_capture).pack(side="right")
-    ttk.Button(row2, text="Apply Settings", style="Secondary.TButton", command=apply_settings).pack(
-        side="right", padx=(0, 8)
-    )
-    ttk.Button(row2, text="Rescan", style="Secondary.TButton", command=rescan).pack(
-        side="right", padx=(0, 8)
-    )
+    row2 = tk.Frame(bar_pad, bg=DORI_CARD)
+    row2.pack(fill="x", pady=(14, 0))
+    _pill_button(
+        row2, "Capture", start_capture, kind="solid", canvas_bg=DORI_CARD,
+    ).pack(side="right")
+    _pill_button(
+        row2, "Apply Settings", apply_settings, kind="outline", canvas_bg=DORI_CARD,
+    ).pack(side="right", padx=(0, 10))
+    _pill_button(
+        row2, "Rescan", rescan, kind="outline", canvas_bg=DORI_CARD,
+    ).pack(side="right", padx=(0, 10))
 
     status_row = tk.Frame(root, bg=DORI_BG)
-    status_row.pack(fill="x", padx=20, pady=(0, 16))
+    status_row.pack(fill="x", padx=28, pady=(0, 12))
     status_label = tk.Label(
         status_row, textvariable=status_var, anchor="w", justify="left",
         bg=DORI_BG, fg=_status_annotation_color(status_var.get()),
-        font=(family, 11), wraplength=800,
+        font=status_font, wraplength=800,
     )
     status_label.pack(fill="x")
 
@@ -1645,7 +1731,10 @@ def run_gui() -> int:
 
     def _on_root_configure(event):
         if event.widget is root:
-            status_label.configure(wraplength=max(event.width - 56, 200))
+            wrap = max(event.width - 72, 200)
+            status_label.configure(wraplength=wrap)
+            for lab in help_labels:
+                lab.configure(wraplength=wrap)
 
     root.bind("<Configure>", _on_root_configure)
 
