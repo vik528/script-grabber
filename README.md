@@ -105,7 +105,7 @@ re-detect cameras and rebuild the list without restarting the app (blocked
 with a warning if a capture is currently in progress).
 
 The navy header includes a **customer logo slot** on the right. Click the
-"Customer logo" placeholder to choose a PNG, GIF, or PPM/PGM file (Tk's
+"ADD LOGO" placeholder to choose a PNG, GIF, or PPM/PGM file (Tk's
 built-in `PhotoImage` — no extra image library). The chosen path is saved
 in `~/.config/script-grabber/ui.json` on Linux/macOS, or
 `%APPDATA%\script-grabber\ui.json` on Windows, and reused on the next
