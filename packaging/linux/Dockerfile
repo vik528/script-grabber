@@ -27,11 +27,15 @@ FROM --platform=${BUILD_PLATFORM} ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# libpython3.12 is required by PyInstaller onefile when using the distro
+# Python (it looks up libpython3.12.so.1.0 at Analysis time). Without it:
+# "Python shared library ('libpython3.12.so.1.0') was not found!"
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 \
         python3-venv \
         python3-tk \
         python3-pip \
+        libpython3.12 \
         binutils \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
