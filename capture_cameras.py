@@ -20,7 +20,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 import argparse
 import datetime
@@ -1017,6 +1017,37 @@ def run_cli(args: argparse.Namespace) -> int:
 # rounded cards with pill controls). GUI capture is sequential into a shared
 # dated shot folder — no Group / PTP / Apply Settings path. CLI is unchanged.
 
+try:
+    from PIL import Image, ImageTk
+    _PIL_AVAILABLE = True
+except ImportError:  # soft dep — GUI capture still works without JPEG previews
+    Image = None  # type: ignore[misc, assignment]
+    ImageTk = None  # type: ignore[misc, assignment]
+    _PIL_AVAILABLE = False
+
+
+def _bmp_to_preview_jpeg(bmp_path: str, jpeg_path: str,
+                         max_width: int = 300, quality: int = 85) -> bool:
+    """Convert a saved BMP to a small RGB JPEG preview. Worker-thread safe.
+    Returns True on success. Basler BMPs may be odd/16-bit-ish modes — always
+    convert to RGB before JPEG encode.
+    """
+    if not _PIL_AVAILABLE:
+        return False
+    try:
+        with Image.open(bmp_path) as im:
+            rgb = im.convert("RGB")
+            w, h = rgb.size
+            if w > max_width and w > 0:
+                new_h = max(1, int(round(h * (max_width / float(w)))))
+                rgb = rgb.resize((max_width, new_h), Image.Resampling.LANCZOS)
+            rgb.save(jpeg_path, "JPEG", quality=quality, optimize=True)
+        return True
+    except Exception:
+        LOG.exception("preview JPEG failed for %s", bmp_path)
+        return False
+
+
 DORI_PRIMARY = "#17B696"
 DORI_NAVY = "#224C5C"
 DORI_BG = "#EAEEF0"
@@ -1474,6 +1505,63 @@ def run_gui() -> int:
         bg=DORI_BG, fg=DORI_MUTED, font=(family, 10), anchor="w", justify="left",
     ).pack(side="left", fill="x", expand=True)
 
+    # --- Post-capture JPEG preview strip ----------------------------------
+    preview_outer, preview_inner = _rounded_panel(
+        content, fill=DORI_CARD, radius=14, shadow=True,
+    )
+    preview_outer.pack(fill="x", pady=(12, 0))
+    preview_pad = tk.Frame(preview_inner, bg=DORI_CARD)
+    preview_pad.pack(fill="x", padx=12, pady=10)
+    tk.Label(
+        preview_pad, text="PREVIEWS", bg=DORI_CARD, fg=DORI_MUTED, font=caps_font,
+    ).pack(anchor="w")
+    preview_strip = tk.Frame(preview_pad, bg=DORI_CARD)
+    preview_strip.pack(fill="x", pady=(8, 0))
+    preview_photos: list = []  # hold ImageTk/PhotoImage refs so Tk won't GC them
+    pillow_warned = [False]
+
+    def _clear_preview_strip():
+        for child in preview_strip.winfo_children():
+            child.destroy()
+        preview_photos.clear()
+
+    def show_preview_empty():
+        """Quiet empty card — shown before any capture and on Rescan."""
+        _clear_preview_strip()
+        tk.Label(
+            preview_strip,
+            text="Previews appear after Capture",
+            bg=DORI_CARD, fg=DORI_MUTED, font=(family, 10),
+        ).pack(anchor="w")
+
+    def add_preview_tile(alias: str, jpeg_path: str) -> None:
+        """Main-thread only. Load JPEG into the wrapping horizontal strip."""
+        if not _PIL_AVAILABLE or ImageTk is None:
+            return
+        # Drop the empty-state label on the first real preview.
+        for child in list(preview_strip.winfo_children()):
+            if isinstance(child, tk.Label) and child.cget("text") == (
+                "Previews appear after Capture"
+            ):
+                child.destroy()
+        try:
+            with Image.open(jpeg_path) as im:
+                rgb = im.convert("RGB")
+                photo = ImageTk.PhotoImage(rgb)
+        except Exception as e:
+            LOG.exception("could not load preview %s", jpeg_path)
+            status_var.set(f"Preview load failed for {alias}: {e}")
+            return
+        preview_photos.append(photo)
+        tile = tk.Frame(preview_strip, bg=DORI_CARD)
+        tile.pack(side="left", padx=(0, 12), pady=(0, 4))
+        tk.Label(tile, image=photo, bg=DORI_CARD).pack()
+        tk.Label(
+            tile, text=alias, bg=DORI_CARD, fg=DORI_NAVY, font=(family, 10),
+        ).pack(pady=(4, 0))
+
+    show_preview_empty()
+
     # --- Session fields (plate / bolts) ------------------------------------
     session_outer, session_inner = _rounded_panel(
         content, fill=DORI_CARD, radius=14, shadow=True,
@@ -1544,12 +1632,26 @@ def run_gui() -> int:
             except Exception as e:
                 ui_queue.put(f"{label}: ERROR {e}")
 
+            display_alias = alias or stem
             cameras_meta.append({
                 "serial": serial,
                 "model": model_raw,
-                "alias": alias or stem,
+                "alias": display_alias,
                 "files": files,
             })
+
+            # JPEG preview from the first saved BMP (Alias_001.bmp). File I/O
+            # stays on this worker thread; only the path is handed to Tk.
+            if files:
+                if not _PIL_AVAILABLE:
+                    ui_queue.put("__NO_PILLOW__")
+                else:
+                    bmp_path = os.path.join(shot_folder, files[0])
+                    jpeg_path = os.path.join(
+                        shot_folder, f"preview_{display_alias}.jpg",
+                    )
+                    if _bmp_to_preview_jpeg(bmp_path, jpeg_path):
+                        ui_queue.put(("__PREVIEW__", display_alias, jpeg_path))
 
         write_shot_manifest(shot_folder, {
             "plate_color": plate_color,
@@ -1570,6 +1672,20 @@ def run_gui() -> int:
                 if msg == "__DONE__":
                     capturing[0] = False
                     status_var.set("Capture complete.")
+                elif msg == "__NO_PILLOW__":
+                    if not pillow_warned[0]:
+                        pillow_warned[0] = True
+                        status_var.set(
+                            "Pillow not installed — JPEG previews skipped. "
+                            "Capture still works."
+                        )
+                elif (
+                    isinstance(msg, tuple)
+                    and len(msg) == 3
+                    and msg[0] == "__PREVIEW__"
+                ):
+                    _alias, _jpeg = msg[1], msg[2]
+                    add_preview_tile(_alias, _jpeg)
                 else:
                     status_var.set(msg)
         except queue.Empty:
@@ -1593,6 +1709,7 @@ def run_gui() -> int:
         outdir_var.set(main_outdir)
         os.makedirs(main_outdir, exist_ok=True)
         capturing[0] = True
+        _clear_preview_strip()  # refill as each camera finishes
         threading.Thread(
             target=worker,
             args=(
@@ -1611,6 +1728,7 @@ def run_gui() -> int:
             return
         devices[:] = discover_or_empty()
         build_camera_rows()
+        show_preview_empty()
         if devices:
             status_var.set(f"Found {len(devices)} camera(s).")
         else:
