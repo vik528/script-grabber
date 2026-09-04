@@ -3,6 +3,18 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.3.3 — 2026-09-04
+
+GUI post-capture JPEG preview frames (Pillow):
+
+- After Capture, each camera that saved images gets a `preview_<Alias>.jpg`
+  in the shot folder (from the first BMP, e.g. `NorthCam_001.bmp`) and a
+  thumbnail in a horizontal preview strip below the camera list.
+- Empty card reads "Previews appear after Capture" until a Capture runs;
+  Rescan restores that empty state. Soft Pillow import — missing Pillow
+  warns once on the status line and skips previews; BMP capture still works.
+- Linux Docker build pins Pillow for GUI JPEG previews in the frozen binary.
+
 ## 1.3.2 — 2026-09-04
 
 GUI shot folders nest plate/bolts under the date:
