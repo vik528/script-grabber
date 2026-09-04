@@ -167,12 +167,12 @@ docker rm sg-extract
 ```
 
 Notes:
-- Builds against Ubuntu 20.04 (glibc 2.31, pypylon's own floor) for the widest
-  forward compatibility with newer Ubuntu versions, targeting x86_64 explicitly
-  (pinned in the Dockerfile, regardless of the build host's own architecture —
-  matters if you're building from an Apple Silicon Mac). Compiles Python 3.11
-  from source inside the container (Ubuntu 20.04's stock Python is 3.8, too
-  old for pypylon's modern wheels).
+- Builds against Ubuntu 24.04 (glibc 2.39) — the oldest Ubuntu this tool is
+  deployed on. Targeting x86_64 explicitly (pinned in the Dockerfile,
+  regardless of the build host's own architecture — matters if you're
+  building from an Apple Silicon Mac). Uses stock Python 3.12 from the
+  image (no compile-from-source step; that was only needed on 20.04's
+  Python 3.8). The frozen binary needs Ubuntu 24.04+.
 - **`pypylon`/`pyinstaller`/`pyinstaller-hooks-contrib` versions are pinned
   exactly** in the Dockerfile (as build ARGs, currently `26.7`/`6.22.2`/
   `2026.7`) — deliberately not left to "whatever's latest on PyPI today."
@@ -217,7 +217,7 @@ triggered by routine pushes:
 
 - **Linux**: reuses `packaging/linux/Dockerfile` unchanged (same
   Docker-in-Docker build as the local instructions above) — same
-  glibc-2.31 floor, same symlink-bug fix, same pinned versions.
+  glibc-2.39 / Ubuntu 24.04 floor, same symlink-bug fix, same pinned versions.
 - **macOS**: plain `pyinstaller --onefile`, no custom `.spec`. Confirmed by
   direct local testing (2026-08-28, Apple Silicon, Python 3.14) that
   PyInstaller performs an analogous top-level-symlink duplication here too
