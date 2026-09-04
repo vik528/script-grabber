@@ -3,6 +3,16 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.3.2 — 2026-09-04
+
+GUI shot folders nest plate/bolts under the date:
+
+`<main>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
+
+Opening a date folder shows one subfolder per combination (e.g. `Black_Big`,
+`Silver_Small`); each Capture press still creates a new time folder inside
+the matching combo. Manifest gains `combo_folder`.
+
 ## 1.3.1 — 2026-09-04
 
 Linux packaging base moved from Ubuntu 20.04 (glibc 2.31, Python 3.11
