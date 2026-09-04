@@ -3,6 +3,15 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.3.1 — 2026-09-04
+
+Linux packaging base moved from Ubuntu 20.04 (glibc 2.31, Python 3.11
+built from source) to Ubuntu 24.04 (glibc 2.39, stock Python 3.12 +
+`python3-tk`). Matches the lab's real OS floor — 24.04 is the oldest
+Ubuntu this tool runs on. The frozen `script-grabber-linux` binary now
+requires Ubuntu 24.04+. PyInstaller/pypylon version pins and the custom
+`.spec` symlink fix are unchanged.
+
 ## 1.3.0 — 2026-09-04
 
 GUI session capture — plate/bolts fields, BMP-only GUI, dated shot folders,
