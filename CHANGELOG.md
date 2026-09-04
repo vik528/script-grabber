@@ -3,6 +3,33 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.3.0 — 2026-09-04
+
+GUI session capture — plate/bolts fields, BMP-only GUI, dated shot folders,
+and fixed camera aliases. CLI capture path is unchanged (still per-camera
+folders; still tiff/png/bmp).
+
+- **Session fields:** Plate Color (Black | Silver, default Black) and Bolts
+  Size (Big | Small, default Big) as single-answer radio buttons; recorded
+  in each shot's `capture_manifest.json`.
+- **BMP-only GUI:** format dropdown removed; read-only BMP label. TIFF/PNG
+  remain available from the CLI only.
+- **Camera cards simplified:** include checkbox + model name + serial
+  (muted). Exposure, Group, Lens (mm), Brand, and Model rows removed.
+  Known serials show an alias label/badge (NorthCam / SouthCam / TopCam).
+- **Dated shot folders:** Browse picks the MAIN outdir. Each Capture click
+  writes into `<main>/<MM-DD>/<HHMMSS>/` (local date/time), with all
+  selected cameras in that one shot folder as `Alias_001.bmp` …
+  `Alias_00N.bmp`, plus one `capture_manifest.json` object
+  (plate_color, bolts_size, timestamp, shot_folder, cameras, count, format).
+- **Aliases by serial:** `40044823`→NorthCam, `40048976`→SouthCam,
+  `40519358`→TopCam. Unknown serials use `sanitize(model)_serial` as the
+  filename stem and still save into the shared shot folder.
+- **No GUI Group/PTP path:** Capture is sequential into the shared shot
+  folder. Apply Settings removed. Group/Lens help replaced with a short
+  plate/bolts + folder-layout hint. Hardware-sync helpers remain in the
+  module for CLI/library use but are not wired through the GUI.
+
 ## 1.2.0 — 2026-09-02
 
 GUI visual polish only — capture, grouping, PTP, lens-manifest, rescan,
