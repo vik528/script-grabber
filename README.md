@@ -112,6 +112,10 @@ python3 capture_cameras.py --gui
   `40519358`→TopCam (shown on the camera card). Unknown serials fall back
   to `sanitize(model)_serial`. Capture is sequential (no GUI Group/PTP).
 - Controls: Rescan, Browse, Capture, Count, Folder — no Apply Settings.
+- **JPEG previews (v1.3.3+):** after Capture, the GUI shows one JPEG
+  thumbnail per camera that saved images (labeled NorthCam / SouthCam /
+  TopCam, etc.), and writes `preview_<Alias>.jpg` into the shot folder.
+  Requires Pillow; without it capture still works and previews are skipped.
 
 The GUI opens fine even if no cameras are detected yet (e.g. you launched
 it before powering on/connecting a camera) — it shows "No cameras
