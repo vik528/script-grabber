@@ -7,9 +7,8 @@ Auto-detects every Basler camera pypylon can see, lets you pick which ones to
 use, and captures a chosen number of images from each. Camera settings
 (exposure, gain, etc.) are left exactly as configured in Pylon Viewer — this
 script never writes acquisition parameters in its default (CLI) flow. Run
-with --gui for an optional window that also lets you view/adjust exposure
-and gain before capturing, and group cameras for hardware-synchronized
-capture (see README.md's "Camera groups" note).
+with --gui for an optional session-oriented window (plate/bolts fields,
+BMP-only, dated shot folders, fixed camera aliases — see README).
 
 Usage:
     python3 capture_cameras.py
@@ -21,7 +20,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import datetime
@@ -67,6 +66,28 @@ def sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
 
 
+# Fixed GUI filename stems keyed by camera serial (string match). Unknown
+# serials fall back to sanitize(model)_serial via camera_file_stem().
+CAMERA_ALIASES_BY_SERIAL = {
+    "40044823": "NorthCam",
+    "40048976": "SouthCam",
+    "40519358": "TopCam",
+}
+
+
+def camera_alias(serial: str) -> Optional[str]:
+    """Return the fixed role alias for a known serial, or None if unknown."""
+    return CAMERA_ALIASES_BY_SERIAL.get(str(serial))
+
+
+def camera_file_stem(serial: str, model: str) -> str:
+    """Filename stem for a GUI shot: known alias, else sanitize(model)_serial."""
+    alias = camera_alias(serial)
+    if alias:
+        return alias
+    return f"{sanitize(model)}_{serial}"
+
+
 def append_manifest_entry(folder: str, entry: dict) -> None:
     """Append one entry to <folder>/capture_manifest.json (created as an
     empty list if absent) — session documentation only (lens info, group
@@ -87,6 +108,18 @@ def append_manifest_entry(folder: str, entry: dict) -> None:
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+    except Exception:
+        LOG.exception("failed to write %s", path)
+
+
+def write_shot_manifest(folder: str, entry: dict) -> None:
+    """Write one Capture's session object to <folder>/capture_manifest.json
+    (overwrite). Used by the GUI dated-shot path. Never raises to the caller."""
+    path = os.path.join(folder, "capture_manifest.json")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entry, f, indent=2)
     except Exception:
         LOG.exception("failed to write %s", path)
 
@@ -298,15 +331,33 @@ def log_camera_state(camera, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=None,
-                         lens_info: Optional[dict] = None) -> None:
-    """`lens_info`, if given, is {"mm": str|None, "brand": str|None,
-    "model": str|None} — pure session documentation (GUI-only; CLI callers
-    never pass this), recorded in a manifest file, never written to the
-    camera or read back by this script."""
+                         lens_info: Optional[dict] = None,
+                         shared_dir: Optional[str] = None,
+                         file_stem: Optional[str] = None) -> list:
+    """Grab `count` frames and save them.
+
+    CLI / default path (no `shared_dir` / `file_stem`): writes into
+    `<outdir>/<model>_<serial>/` as
+    `<model>_<serial>_<shot:04d>_<timestamp>.<fmt>`.
+
+    GUI session path: pass `shared_dir` (the dated shot folder) and
+    `file_stem` (e.g. NorthCam) so files land as
+    `{file_stem}_{shot:03d}.{fmt}` inside that shared folder — no
+    per-camera subfolder, no timestamp in the filename.
+
+    `lens_info`, if given, is {"mm", "brand", "model"} session documentation
+    appended via append_manifest_entry (legacy; GUI session capture writes
+    its own shot-level manifest instead). Returns the list of filenames
+    saved (basename only).
+    """
     serial = camera.DeviceInfo.GetSerialNumber()
     model = sanitize(camera.DeviceInfo.GetModelName())
-    cam_dir = os.path.join(outdir, f"{model}_{serial}")
+    if shared_dir:
+        cam_dir = shared_dir
+    else:
+        cam_dir = os.path.join(outdir, f"{model}_{serial}")
     os.makedirs(cam_dir, exist_ok=True)
+    saved: list = []
 
     try:
         try:
@@ -346,9 +397,13 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
                         warned_bit_depth = True
 
                     shot += 1
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    filename = f"{model}_{serial}_{shot:04d}_{ts}.{fmt}"
+                    if file_stem:
+                        filename = f"{file_stem}_{shot:03d}.{fmt}"
+                    else:
+                        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        filename = f"{model}_{serial}_{shot:04d}_{ts}.{fmt}"
                     converted.Save(FILE_FORMATS[fmt], os.path.join(cam_dir, filename))
+                    saved.append(filename)
                     if progress_cb:
                         progress_cb(shot, count)
             except pylon.TimeoutException as e:
@@ -369,6 +424,7 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
             camera.StopGrabbing()
         if camera.IsOpen():
             camera.Close()
+    return saved
 
 
 # ---------------------------------------------------------------------------
@@ -955,11 +1011,11 @@ def run_cli(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Optional Tkinter GUI: camera selection + exposure/gain + capture, in one place
+# Optional Tkinter GUI: session capture (plate/bolts, BMP, dated shot folders)
 # ---------------------------------------------------------------------------
 # Visual shell is Dori-branded (navy header, teal primary, gray page, white
-# rounded cards with pill controls). Capture, grouping, PTP, lens-manifest,
-# rescan, apply-settings, and the worker-thread / ui_queue contract are unchanged.
+# rounded cards with pill controls). GUI capture is sequential into a shared
+# dated shot folder — no Group / PTP / Apply Settings path. CLI is unchanged.
 
 DORI_PRIMARY = "#17B696"
 DORI_NAVY = "#224C5C"
@@ -1151,12 +1207,22 @@ def run_gui() -> int:
     family = _ui_font_family(tkfont)
     style = ttk.Style(root)
     _apply_dori_theme(style, family)
+    style.configure(
+        "Card.TRadiobutton",
+        background=DORI_CARD,
+        foreground=DORI_TEXT,
+        font=(family, 11),
+        focuscolor=DORI_CARD,
+    )
+    style.map(
+        "Card.TRadiobutton",
+        background=[("active", DORI_CARD), ("selected", DORI_CARD)],
+        foreground=[("disabled", DORI_MUTED)],
+    )
     title_font = tkfont.Font(family=family, size=18, weight="normal")
     subtitle_font = tkfont.Font(family=family, size=11, weight="normal")
     caps_font = tkfont.Font(family=family, size=8, weight="normal")
     pill_font = tkfont.Font(family=family, size=11, weight="normal")
-    link_font = tkfont.Font(family=family, size=11, weight="normal", underline=False)
-    link_font_hover = tkfont.Font(family=family, size=11, weight="normal", underline=True)
     status_font = tkfont.Font(family=family, size=9, weight="normal")
 
     def _rounded_panel(parent, fill=DORI_CARD, radius=14, shadow=True, canvas_bg=None):
@@ -1240,11 +1306,6 @@ def run_gui() -> int:
     capturing = [False]  # list-boxed so nested functions can mutate it without `nonlocal`
 
     cam_vars = []
-    exposure_vars = []
-    group_vars = []
-    lens_mm_vars = []
-    lens_brand_vars = []
-    lens_model_vars = []
 
     # --- Header (navy) + hairline teal accent ------------------------------
     header = tk.Frame(root, bg=DORI_NAVY)
@@ -1343,19 +1404,12 @@ def run_gui() -> int:
     def build_camera_rows():
         # Rebuildable so Rescan can pick up cameras connected after the
         # window was already opened, without restarting the GUI. Mutates
-        # devices/cam_vars/exposure_vars/group_vars/lens_*_vars IN PLACE
-        # (clear + re-populate) rather than rebinding them, so every other
-        # closure in this function (worker/start_capture/apply_settings/
-        # load_current_settings) — all defined once, reading these same
-        # list objects by reference — sees the rebuilt contents automatically.
+        # devices/cam_vars IN PLACE (clear + re-populate) rather than
+        # rebinding them, so every other closure reading these list objects
+        # by reference sees the rebuilt contents automatically.
         for child in cams_frame.winfo_children():
             child.destroy()
         cam_vars.clear()
-        exposure_vars.clear()
-        group_vars.clear()
-        lens_mm_vars.clear()
-        lens_brand_vars.clear()
-        lens_model_vars.clear()
 
         if not devices:
             empty_outer, empty_inner = _rounded_panel(
@@ -1388,47 +1442,25 @@ def run_gui() -> int:
             top.pack(fill="x")
             v = tk.BooleanVar(value=True)
             cam_vars.append(v)
+            serial = str(d.GetSerialNumber())
+            model_name = d.GetModelName()
+            alias = camera_alias(serial)
+            if alias:
+                cb_text = f"{alias} — {model_name}"
+            else:
+                cb_text = model_name
             ttk.Checkbutton(
-                top, text=d.GetModelName(), variable=v, style="Card.TCheckbutton",
+                top, text=cb_text, variable=v, style="Card.TCheckbutton",
             ).pack(side="left")
             ttk.Label(
-                top, text=f"S/N {d.GetSerialNumber()}", style="CardMuted.TLabel",
+                top, text=f"S/N {serial}", style="CardMuted.TLabel",
             ).pack(side="left", padx=(10, 0))
-
-            exp_var = tk.StringVar()
-            exposure_vars.append(exp_var)
-            group_var = tk.StringVar()
-            group_vars.append(group_var)
-
-            mid = tk.Frame(inner, bg=DORI_CARD)
-            mid.pack(fill="x", pady=(8, 0))
-            ttk.Label(mid, text="Exposure (us):", style="Card.TLabel").pack(side="left")
-            ttk.Entry(mid, textvariable=exp_var, width=10).pack(side="left", padx=(6, 0))
-            # Blank by default — collision-free (no shared implicit label
-            # like str(i) could accidentally pull two rows into the same
-            # group) and means "capture on its own," identical to today's
-            # behavior with zero user interaction.
-            ttk.Label(mid, text="Group:", style="Card.TLabel").pack(side="left", padx=(16, 0))
-            ttk.Entry(mid, textvariable=group_var, width=6).pack(side="left", padx=(6, 0))
-
-            # Second, quieter sub-row: lens info — pure session
-            # documentation, never written to the camera.
-            lens_row = tk.Frame(inner, bg=DORI_CARD)
-            lens_row.pack(fill="x", pady=(6, 0))
-            lens_mm_var = tk.StringVar()
-            lens_brand_var = tk.StringVar()
-            lens_model_var = tk.StringVar()
-            lens_mm_vars.append(lens_mm_var)
-            lens_brand_vars.append(lens_brand_var)
-            lens_model_vars.append(lens_model_var)
-            ttk.Label(lens_row, text="Lens (mm):", style="CardMuted.TLabel").pack(side="left")
-            ttk.Entry(lens_row, textvariable=lens_mm_var, width=6).pack(side="left", padx=(6, 0))
-            ttk.Label(lens_row, text="Brand:", style="CardMuted.TLabel").pack(side="left", padx=(12, 0))
-            ttk.Entry(lens_row, textvariable=lens_brand_var, width=10).pack(side="left", padx=(6, 0))
-            ttk.Label(lens_row, text="Model (optional):", style="CardMuted.TLabel").pack(
-                side="left", padx=(12, 0)
-            )
-            ttk.Entry(lens_row, textvariable=lens_model_var, width=14).pack(side="left", padx=(6, 0))
+            if alias:
+                badge = tk.Label(
+                    top, text=alias, bg="#E8F5F1", fg=DORI_PRIMARY,
+                    font=(family, 9), padx=8, pady=1,
+                )
+                badge.pack(side="right")
 
     build_camera_rows()
 
@@ -1436,168 +1468,93 @@ def run_gui() -> int:
     hint_row.pack(fill="x", pady=(4, 0))
     tk.Label(
         hint_row,
-        text="Same Group value = hardware-synced capture into one folder.  "
-             "Lens fields are session notes only.",
+        text="Set plate color & bolts size, then Capture → "
+             "<folder>/<MM-DD>/<HHMMSS>/ with NorthCam / SouthCam / TopCam BMPs.",
         bg=DORI_BG, fg=DORI_MUTED, font=(family, 10), anchor="w", justify="left",
     ).pack(side="left", fill="x", expand=True)
-    help_visible = [False]
-    help_body = tk.Frame(content, bg=DORI_BG)
 
-    def toggle_help(_event=None):
-        help_visible[0] = not help_visible[0]
-        if help_visible[0]:
-            help_body.pack(fill="x", pady=(6, 0), after=hint_row)
-            help_link.configure(text="Help ▾")
-        else:
-            help_body.pack_forget()
-            help_link.configure(text="Help")
-
-    help_link = tk.Label(
-        hint_row, text="Help", bg=DORI_BG, fg=DORI_PRIMARY,
-        font=link_font, cursor="hand2",
+    # --- Session fields (plate / bolts) ------------------------------------
+    session_outer, session_inner = _rounded_panel(
+        content, fill=DORI_CARD, radius=14, shadow=True,
     )
-    help_link.pack(side="right", padx=(12, 0))
-    help_link.bind("<Button-1>", toggle_help)
-    help_link.bind("<Enter>", lambda _e: help_link.configure(font=link_font_hover))
-    help_link.bind("<Leave>", lambda _e: help_link.configure(font=link_font))
+    session_outer.pack(fill="x", pady=(12, 0))
+    session_pad = tk.Frame(session_inner, bg=DORI_CARD)
+    session_pad.pack(fill="x", padx=12, pady=10)
 
-    help_labels = []
-    for i, (txt, extra_pady) in enumerate((
-        (
-            "Group: cameras sharing the same Group value fire together "
-            "(hardware-synced) and save into one shared folder. Leave blank "
-            "to capture that camera on its own, as today.",
-            (0, 4),
-        ),
-        (
-            "Lens (mm)/Brand/Model: session documentation only, saved "
-            "alongside the images — never written to the camera. All three "
-            "fields may be left blank.",
-            (0, 0),
-        ),
-    )):
-        lab = tk.Label(
-            help_body, text=txt, bg=DORI_BG, fg=DORI_MUTED,
-            font=(family, 10), wraplength=760, justify="left", anchor="w",
-        )
-        lab.pack(fill="x", pady=extra_pady)
-        help_labels.append(lab)
+    plate_color_var = tk.StringVar(value="Black")
+    bolts_size_var = tk.StringVar(value="Big")
 
-    def _read_first(cam, names, default=""):
-        for n in names:
-            val = read_node(getattr(cam, n))
-            if val is not None:
-                return val
-        return default
+    def _session_choice_row(parent, label, var, choices):
+        row = tk.Frame(parent, bg=DORI_CARD)
+        row.pack(fill="x", pady=(0, 8))
+        tk.Label(
+            row, text=label, bg=DORI_CARD, fg=DORI_MUTED, font=caps_font,
+        ).pack(side="left")
+        for choice in choices:
+            ttk.Radiobutton(
+                row, text=choice, value=choice, variable=var,
+                style="Card.TRadiobutton",
+            ).pack(side="left", padx=(14 if choice == choices[0] else 10, 0))
+        return row
 
-    def _write_first(cam, names, value) -> bool:
-        for n in names:
-            if getattr(cam, n).TrySetValue(value):
-                return True
-        return False
-
-    def _create_camera_or_report(d):
-        # CreateDevice() itself can raise for a camera that's on the network
-        # but currently unreachable/flaky (confirmed live: a real GigE camera
-        # failed here with a RuntimeException reading device memory) — must
-        # be guarded exactly like Open(), not just assumed to succeed.
-        try:
-            return pylon.InstantCamera(tl_factory.CreateDevice(d))
-        except Exception as e:
-            status_var.set(f"Camera {d.GetSerialNumber()}: could not connect ({e}).")
-            return None
-
-    def _open_or_report(cam, serial) -> bool:
-        try:
-            cam.Open()
-            return True
-        except Exception as e:
-            status_var.set(
-                f"Camera {serial}: could not open ({e}). Close Pylon Viewer / "
-                "any other connection to it first."
-            )
-            return False
-
-    def load_current_settings():
-        # Read-only — never writes anything, safe to call on window open.
-        for i, d in enumerate(devices):
-            cam = _create_camera_or_report(d)
-            if cam is None:
-                continue
-            try:
-                if not _open_or_report(cam, d.GetSerialNumber()):
-                    continue
-                exposure_vars[i].set(str(_read_first(cam, EXPOSURE_NODE_CANDIDATES)))
-            finally:
-                if cam.IsOpen():
-                    cam.Close()
-
-    def apply_settings():
-        for i, d in enumerate(devices):
-            if not cam_vars[i].get():
-                continue
-            cam = _create_camera_or_report(d)
-            if cam is None:
-                continue
-            try:
-                if not _open_or_report(cam, d.GetSerialNumber()):
-                    continue
-                # Auto-exposure must be off before a manual write will take
-                # effect — only disabled here, on explicit submit.
-                cam.ExposureAuto.TrySetValue("Off")
-                if exposure_vars[i].get():
-                    if not _write_first(cam, EXPOSURE_NODE_CANDIDATES, float(exposure_vars[i].get())):
-                        status_var.set(f"Camera {i}: exposure value rejected by device.")
-            finally:
-                if cam.IsOpen():
-                    cam.Close()
-        status_var.set("Settings applied.")
+    _session_choice_row(session_pad, "PLATE COLOR", plate_color_var, ("Black", "Silver"))
+    last = _session_choice_row(session_pad, "BOLTS SIZE", bolts_size_var, ("Big", "Small"))
+    last.pack_configure(pady=(0, 0))
 
     count_var = tk.IntVar(value=10)
-    fmt_var = tk.StringVar(value="tiff")
     outdir_var = tk.StringVar(value=os.path.abspath("./captures"))
 
     # Capture runs in a worker thread; Tk widgets must only ever be touched
     # from the main thread, so the worker pushes status strings onto a queue
     # that a root.after loop drains on the GUI thread.
-    def worker(groups, count, fmt, outdir, lens_by_idx):
-        for group in groups:
-            if len(group) == 1:
-                idx = group[0]
-                label = devices[idx].GetModelName()
+    def worker(indices, count, outdir, plate_color, bolts_size):
+        now = datetime.datetime.now()
+        date_folder = now.strftime("%m-%d")
+        time_folder = now.strftime("%H%M%S")
+        shot_folder = os.path.join(outdir, date_folder, time_folder)
+        os.makedirs(shot_folder, exist_ok=True)
+        ui_queue.put(f"Shot folder: {shot_folder}")
 
-                def cb(shot, total, label=label):
-                    ui_queue.put(f"{label}: {shot}/{total}")
+        fmt = "bmp"
+        cameras_meta = []
+        for idx in indices:
+            d = devices[idx]
+            serial = str(d.GetSerialNumber())
+            model_raw = d.GetModelName()
+            model = sanitize(model_raw)
+            alias = camera_alias(serial)
+            stem = camera_file_stem(serial, model_raw)
+            label = alias or model_raw
 
-                try:
-                    cam = pylon.InstantCamera(tl_factory.CreateDevice(devices[idx]))
-                    capture_from_camera(cam, count, fmt, outdir, progress_cb=cb,
-                                         lens_info=lens_by_idx.get(idx))
-                except Exception as e:
-                    ui_queue.put(f"{label}: ERROR {e}")
-            else:
-                serials = [devices[i].GetSerialNumber() for i in group]
-                group_desc = "+".join(devices[i].GetModelName() for i in group)
-                group_label = group_vars[group[0]].get().strip()
-                lens_info = {devices[i].GetSerialNumber(): lens_by_idx.get(i) for i in group}
-                ui_queue.put(f"[Group {group_desc}] starting synchronized capture...")
-                try:
-                    cams = [pylon.InstantCamera(tl_factory.CreateDevice(devices[i])) for i in group]
-                    results = capture_group_synchronized(
-                        cams, serials, count, fmt, outdir,
-                        progress_cb=lambda s, shot, total: ui_queue.put(f"{s}: {shot}/{total} (sync)"),
-                        log_cb=ui_queue.put,
-                        group_label=group_label, lens_info=lens_info,
-                    )
-                    for s, r in results.items():
-                        tail = f" — {r['error']}" if r["error"] else " — OK"
-                        ui_queue.put(f"{s}: {r['shots_saved']}/{count} shots{tail}")
-                except Exception as e:
-                    # Safety net: CreateDevice() above is outside
-                    # capture_group_synchronized's own try/except, so an
-                    # unexpected failure there still needs to surface here
-                    # instead of silently killing the worker thread.
-                    ui_queue.put(f"[Group {group_desc}] ERROR {e}")
+            def cb(shot, total, label=label):
+                ui_queue.put(f"{label}: {shot}/{total}")
+
+            files = []
+            try:
+                cam = pylon.InstantCamera(tl_factory.CreateDevice(d))
+                files = capture_from_camera(
+                    cam, count, fmt, outdir, progress_cb=cb,
+                    shared_dir=shot_folder, file_stem=stem,
+                )
+            except Exception as e:
+                ui_queue.put(f"{label}: ERROR {e}")
+
+            cameras_meta.append({
+                "serial": serial,
+                "model": model_raw,
+                "alias": alias or stem,
+                "files": files,
+            })
+
+        write_shot_manifest(shot_folder, {
+            "plate_color": plate_color,
+            "bolts_size": bolts_size,
+            "timestamp": now.isoformat(timespec="seconds"),
+            "shot_folder": shot_folder,
+            "cameras": cameras_meta,
+            "count": count,
+            "format": fmt,
+        })
         ui_queue.put("__DONE__")
 
     def poll_queue():
@@ -1626,33 +1583,16 @@ def run_gui() -> int:
             messagebox.showwarning("Invalid count", "Count must be a positive integer.")
             return
 
-        lens_by_idx = {}
-        for i in indices:
-            mm_raw = lens_mm_vars[i].get().strip()
-            mm = None
-            if mm_raw:
-                try:
-                    mm = float(mm_raw)
-                    if mm <= 0:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showwarning(
-                        "Invalid lens (mm)",
-                        f"Camera {devices[i].GetModelName()}: Lens (mm) must be a "
-                        "positive number, or left blank.",
-                    )
-                    return
-            lens_by_idx[i] = {
-                "mm": mm,
-                "brand": lens_brand_vars[i].get().strip() or None,
-                "model": lens_model_vars[i].get().strip() or None,
-            }
-
-        os.makedirs(outdir_var.get(), exist_ok=True)
-        groups = partition_into_groups(indices, lambda i: group_vars[i].get())
+        main_outdir = outdir_var.get().strip() or os.path.abspath("./captures")
+        outdir_var.set(main_outdir)
+        os.makedirs(main_outdir, exist_ok=True)
         capturing[0] = True
         threading.Thread(
-            target=worker, args=(groups, count, fmt_var.get(), outdir_var.get(), lens_by_idx),
+            target=worker,
+            args=(
+                indices, count, main_outdir,
+                plate_color_var.get(), bolts_size_var.get(),
+            ),
             daemon=True,
         ).start()
 
@@ -1666,7 +1606,6 @@ def run_gui() -> int:
         devices[:] = discover_or_empty()
         build_camera_rows()
         if devices:
-            load_current_settings()
             status_var.set(f"Found {len(devices)} camera(s).")
         else:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
@@ -1689,9 +1628,8 @@ def run_gui() -> int:
     _caps(row1, "COUNT").pack(side="left")
     ttk.Entry(row1, textvariable=count_var, width=6).pack(side="left", padx=(8, 0))
     _caps(row1, "FORMAT").pack(side="left", padx=(20, 0))
-    ttk.Combobox(
-        row1, textvariable=fmt_var, values=("tiff", "png", "bmp"),
-        state="readonly", width=8,
+    tk.Label(
+        row1, text="BMP", bg=DORI_CARD, fg=DORI_TEXT, font=(family, 11),
     ).pack(side="left", padx=(8, 0))
     _caps(row1, "FOLDER").pack(side="left", padx=(20, 0))
     ttk.Entry(row1, textvariable=outdir_var).pack(
@@ -1708,9 +1646,6 @@ def run_gui() -> int:
     _pill_button(
         row2, "Capture", start_capture, kind="solid", canvas_bg=DORI_CARD,
     ).pack(side="right")
-    _pill_button(
-        row2, "Apply Settings", apply_settings, kind="outline", canvas_bg=DORI_CARD,
-    ).pack(side="right", padx=(0, 10))
     _pill_button(
         row2, "Rescan", rescan, kind="outline", canvas_bg=DORI_CARD,
     ).pack(side="right", padx=(0, 10))
@@ -1733,15 +1668,13 @@ def run_gui() -> int:
         if event.widget is root:
             wrap = max(event.width - 72, 200)
             status_label.configure(wraplength=wrap)
-            for lab in help_labels:
-                lab.configure(wraplength=wrap)
 
     root.bind("<Configure>", _on_root_configure)
 
-    load_current_settings()
     poll_queue()
     root.mainloop()
     return 0
+
 
 
 # ---------------------------------------------------------------------------
