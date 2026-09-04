@@ -54,6 +54,8 @@ COPY packaging/linux/script-grabber.spec .
 ARG PYPYLON_VERSION=26.7
 ARG PYINSTALLER_VERSION=6.22.2
 ARG PYINSTALLER_HOOKS_CONTRIB_VERSION=2026.7
+# Pillow: GUI JPEG post-capture preview frames (preview_<Alias>.jpg + strip).
+ARG PILLOW_VERSION=11.2.1
 
 RUN python3 -m venv /build/venv \
     && /build/venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -61,6 +63,7 @@ RUN python3 -m venv /build/venv \
         "pypylon==${PYPYLON_VERSION}" \
         "pyinstaller==${PYINSTALLER_VERSION}" \
         "pyinstaller-hooks-contrib==${PYINSTALLER_HOOKS_CONTRIB_VERSION}" \
+        "Pillow==${PILLOW_VERSION}" \
     && /build/venv/bin/python -c "import tkinter" # fail fast here, not deep in the PyInstaller run, if python3-tk wasn't installed
 
 # Uses the custom script-grabber.spec (not a plain `--onefile` invocation) —
