@@ -20,7 +20,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import argparse
 import datetime
@@ -1469,7 +1469,8 @@ def run_gui() -> int:
     tk.Label(
         hint_row,
         text="Set plate color & bolts size, then Capture → "
-             "<folder>/<MM-DD>/<HHMMSS>/ with NorthCam / SouthCam / TopCam BMPs.",
+             "<folder>/<MM-DD>/<Plate>_<Bolts>/<HHMMSS>/ "
+             "(e.g. Black_Big). All cams land in that shot folder.",
         bg=DORI_BG, fg=DORI_MUTED, font=(family, 10), anchor="w", justify="left",
     ).pack(side="left", fill="x", expand=True)
 
@@ -1510,8 +1511,12 @@ def run_gui() -> int:
     def worker(indices, count, outdir, plate_color, bolts_size):
         now = datetime.datetime.now()
         date_folder = now.strftime("%m-%d")
+        # One folder per plate/bolts combo under the date, then one shot
+        # folder per Capture click — so opening MM-DD shows Black_Big /
+        # Silver_Small / etc., and each press nests under the matching combo.
+        combo_folder = f"{sanitize(plate_color)}_{sanitize(bolts_size)}"
         time_folder = now.strftime("%H%M%S")
-        shot_folder = os.path.join(outdir, date_folder, time_folder)
+        shot_folder = os.path.join(outdir, date_folder, combo_folder, time_folder)
         os.makedirs(shot_folder, exist_ok=True)
         ui_queue.put(f"Shot folder: {shot_folder}")
 
@@ -1549,6 +1554,7 @@ def run_gui() -> int:
         write_shot_manifest(shot_folder, {
             "plate_color": plate_color,
             "bolts_size": bolts_size,
+            "combo_folder": combo_folder,
             "timestamp": now.isoformat(timespec="seconds"),
             "shot_folder": shot_folder,
             "cameras": cameras_meta,
