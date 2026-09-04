@@ -101,9 +101,12 @@ python3 capture_cameras.py --gui
   shot's `capture_manifest.json`.
 - **BMP only** in the GUI (read-only label). Use the CLI for TIFF/PNG.
 - **Folder layout:** Browse picks the MAIN outdir. Each Capture click
-  creates `<main>/<MM-DD>/<HHMMSS>/` from the local computer's date/time
-  (e.g. `./captures/09-04/143052/`) and saves every selected camera into
-  that one shot folder as `NorthCam_001.bmp`, `SouthCam_001.bmp`, …
+  creates `<main>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/` from the
+  local computer's date/time (e.g. `./captures/09-04/Black_Big/143052/`).
+  Opening a date folder shows one subfolder per plate/bolts combo
+  (`Black_Big`, `Silver_Small`, …); each Capture press adds a new time
+  folder inside the matching combo. All selected cameras for that press
+  land in that shot folder as `NorthCam_001.bmp`, `SouthCam_001.bmp`, …
   plus `capture_manifest.json`. Count `N` → `Alias_001.bmp` … `Alias_00N.bmp`.
 - **Camera names by serial:** `40044823`→NorthCam, `40048976`→SouthCam,
   `40519358`→TopCam (shown on the camera card). Unknown serials fall back
@@ -151,7 +154,9 @@ $env:PYLON_CAMEMU=2; python capture_cameras.py
 under `<outdir>/<model>_<serial>/`.
 
 **GUI:** images are saved as `<Alias>_<shot:03d>.bmp` under
-`<main_outdir>/<MM-DD>/<HHMMSS>/` (local date/time when Capture is clicked).
+`<main_outdir>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
+(local date/time when Capture is clicked; plate/bolts combo groups shots
+under the date folder).
 
 ## Standalone executable (Linux)
 
