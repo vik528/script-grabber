@@ -3,6 +3,91 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.3.3 — 2026-09-04
+
+GUI post-capture JPEG preview frames (Pillow):
+
+- After Capture, each camera that saved images gets a `preview_<Alias>.jpg`
+  in the shot folder (from the first BMP, e.g. `NorthCam_001.bmp`) and a
+  thumbnail in a horizontal preview strip below the camera list.
+- Empty card reads "Previews appear after Capture" until a Capture runs;
+  Rescan restores that empty state. Soft Pillow import — missing Pillow
+  warns once on the status line and skips previews; BMP capture still works.
+- Linux Docker build pins Pillow for GUI JPEG previews in the frozen binary.
+
+## 1.3.2 — 2026-09-04
+
+GUI shot folders nest plate/bolts under the date:
+
+`<main>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
+
+Opening a date folder shows one subfolder per combination (e.g. `Black_Big`,
+`Silver_Small`); each Capture press still creates a new time folder inside
+the matching combo. Manifest gains `combo_folder`.
+
+## 1.3.1 — 2026-09-04
+
+Linux packaging base moved from Ubuntu 20.04 (glibc 2.31, Python 3.11
+built from source) to Ubuntu 24.04 (glibc 2.39, stock Python 3.12 +
+`python3-tk`). Matches the lab's real OS floor — 24.04 is the oldest
+Ubuntu this tool runs on. The frozen `script-grabber-linux` binary now
+requires Ubuntu 24.04+. PyInstaller/pypylon version pins and the custom
+`.spec` symlink fix are unchanged.
+
+## 1.3.0 — 2026-09-04
+
+GUI session capture — plate/bolts fields, BMP-only GUI, dated shot folders,
+and fixed camera aliases. CLI capture path is unchanged (still per-camera
+folders; still tiff/png/bmp).
+
+- **Session fields:** Plate Color (Black | Silver, default Black) and Bolts
+  Size (Big | Small, default Big) as single-answer radio buttons; recorded
+  in each shot's `capture_manifest.json`.
+- **BMP-only GUI:** format dropdown removed; read-only BMP label. TIFF/PNG
+  remain available from the CLI only.
+- **Camera cards simplified:** include checkbox + model name + serial
+  (muted). Exposure, Group, Lens (mm), Brand, and Model rows removed.
+  Known serials show an alias label/badge (NorthCam / SouthCam / TopCam).
+- **Dated shot folders:** Browse picks the MAIN outdir. Each Capture click
+  writes into `<main>/<MM-DD>/<HHMMSS>/` (local date/time), with all
+  selected cameras in that one shot folder as `Alias_001.bmp` …
+  `Alias_00N.bmp`, plus one `capture_manifest.json` object
+  (plate_color, bolts_size, timestamp, shot_folder, cameras, count, format).
+- **Aliases by serial:** `40044823`→NorthCam, `40048976`→SouthCam,
+  `40519358`→TopCam. Unknown serials use `sanitize(model)_serial` as the
+  filename stem and still save into the shared shot folder.
+- **No GUI Group/PTP path:** Capture is sequential into the shared shot
+  folder. Apply Settings removed. Group/Lens help replaced with a short
+  plate/bolts + folder-layout hint. Hardware-sync helpers remain in the
+  module for CLI/library use but are not wired through the GUI.
+
+## 1.2.0 — 2026-09-02
+
+GUI visual polish only — capture, grouping, PTP, lens-manifest, rescan,
+apply-settings, threading, and CLI behavior are unchanged.
+
+- Dori-themed Tkinter/ttk shell: page background `#EAEEF0`, navy header
+  (`#224C5C`) with product name + version, teal primary Capture button
+  (`#17B696`), navy secondary actions (Rescan / Apply Settings / Browse).
+- Customer logo slot in the header (~40px rounded well). Click the
+  "ADD LOGO" placeholder to choose a PNG/GIF/PPM image (stdlib `PhotoImage`;
+  no Pillow). Path is persisted in `~/.config/script-grabber/ui.json`
+  (Linux/macOS) or `%APPDATA%\script-grabber\ui.json` (Windows). Missing
+  file falls back to the placeholder. No logo is bundled.
+- Visual refinement: rounded chrome on cards, the logo well, and the
+  control bar (Canvas round-rect + inner Frame, 12–16px radius, soft 2px
+  `#C5CFD4` shadow). Capture is a solid teal pill; Rescan / Apply Settings /
+  Browse are navy-outline pills. Help is a teal text link. Header is one
+  editorial line with a muted subtitle; empty state sits in a large padded
+  card; status footer is quieter. Inputs remain ttk.
+- Camera list restyled as white cards (model + serial, include checkbox,
+  Exposure/Group, quieter lens row). Centered empty state when none are
+  detected. Group/Lens help moved into a short hint + collapsible Help
+  panel (same text, no longer always-visible stacked labels).
+- Bottom action bar shows the output folder path. Status line uses
+  annotation colors (ok `#00695C` / warning `#FFAB40` / error `#B71C1C`) by
+  parsing existing status strings.
+
 ## 1.1.0 — 2026-08-28
 
 Project moved into git, hosted at github.com/vik528/script-grabber. Added

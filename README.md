@@ -89,20 +89,47 @@ python3 capture_cameras.py --cameras all --count 10 --format tiff --outdir ./cap
 - `--format` — `tiff` (default, lossless/full bit depth), `png`, or `bmp` (note: BMP always saves 8-bit)
 - `--outdir` — output directory (default `./captures`); each camera gets its own subfolder inside it, named `<model>_<serial>`
 
-Optional combined GUI (camera selection + exposure/gain + capture, all in one window):
+Optional session GUI (camera selection + plate/bolts + capture):
 
 ```bash
 python3 capture_cameras.py --gui
 ```
 
-The GUI also lets you group cameras for synchronized capture — see
-"Camera groups (GUI only)" under Notes below.
+**GUI session capture (v1.3.0+):**
+- **Plate Color** (Black | Silver, default Black) and **Bolts Size**
+  (Big | Small, default Big) — single-answer radios, written into each
+  shot's `capture_manifest.json`.
+- **BMP only** in the GUI (read-only label). Use the CLI for TIFF/PNG.
+- **Folder layout:** Browse picks the MAIN outdir. Each Capture click
+  creates `<main>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/` from the
+  local computer's date/time (e.g. `./captures/09-04/Black_Big/143052/`).
+  Opening a date folder shows one subfolder per plate/bolts combo
+  (`Black_Big`, `Silver_Small`, …); each Capture press adds a new time
+  folder inside the matching combo. All selected cameras for that press
+  land in that shot folder as `NorthCam_001.bmp`, `SouthCam_001.bmp`, …
+  plus `capture_manifest.json`. Count `N` → `Alias_001.bmp` … `Alias_00N.bmp`.
+- **Camera names by serial:** `40044823`→NorthCam, `40048976`→SouthCam,
+  `40519358`→TopCam (shown on the camera card). Unknown serials fall back
+  to `sanitize(model)_serial`. Capture is sequential (no GUI Group/PTP).
+- Controls: Rescan, Browse, Capture, Count, Folder — no Apply Settings.
+- **JPEG previews (v1.3.3+):** after Capture, the GUI shows one JPEG
+  thumbnail per camera that saved images (labeled NorthCam / SouthCam /
+  TopCam, etc.), and writes `preview_<Alias>.jpg` into the shot folder.
+  Requires Pillow; without it capture still works and previews are skipped.
 
 The GUI opens fine even if no cameras are detected yet (e.g. you launched
 it before powering on/connecting a camera) — it shows "No cameras
 detected" instead of erroring out. Click **Rescan** at any point to
 re-detect cameras and rebuild the list without restarting the app (blocked
 with a warning if a capture is currently in progress).
+
+The navy header includes a **customer logo slot** on the right. Click the
+"ADD LOGO" placeholder to choose a PNG, GIF, or PPM/PGM file (Tk's
+built-in `PhotoImage` — no extra image library). The chosen path is saved
+in `~/.config/script-grabber/ui.json` on Linux/macOS, or
+`%APPDATA%\script-grabber\ui.json` on Windows, and reused on the next
+launch. If that file is missing later, the placeholder returns. No logo
+image is bundled with the app.
 
 ## Testing without hardware attached
 
@@ -127,7 +154,13 @@ $env:PYLON_CAMEMU=2; python capture_cameras.py
 
 ## Filenames
 
-Images are saved as `<model>_<serial>_<shotindex>_<timestamp>.<ext>`.
+**CLI:** images are saved as `<model>_<serial>_<shotindex>_<timestamp>.<ext>`
+under `<outdir>/<model>_<serial>/`.
+
+**GUI:** images are saved as `<Alias>_<shot:03d>.bmp` under
+`<main_outdir>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
+(local date/time when Capture is clicked; plate/bolts combo groups shots
+under the date folder).
 
 ## Standalone executable (Linux)
 
@@ -143,12 +176,12 @@ docker rm sg-extract
 ```
 
 Notes:
-- Builds against Ubuntu 20.04 (glibc 2.31, pypylon's own floor) for the widest
-  forward compatibility with newer Ubuntu versions, targeting x86_64 explicitly
-  (pinned in the Dockerfile, regardless of the build host's own architecture —
-  matters if you're building from an Apple Silicon Mac). Compiles Python 3.11
-  from source inside the container (Ubuntu 20.04's stock Python is 3.8, too
-  old for pypylon's modern wheels).
+- Builds against Ubuntu 24.04 (glibc 2.39) — the oldest Ubuntu this tool is
+  deployed on. Targeting x86_64 explicitly (pinned in the Dockerfile,
+  regardless of the build host's own architecture — matters if you're
+  building from an Apple Silicon Mac). Uses stock Python 3.12 from the
+  image (no compile-from-source step; that was only needed on 20.04's
+  Python 3.8). The frozen binary needs Ubuntu 24.04+.
 - **`pypylon`/`pyinstaller`/`pyinstaller-hooks-contrib` versions are pinned
   exactly** in the Dockerfile (as build ARGs, currently `26.7`/`6.22.2`/
   `2026.7`) — deliberately not left to "whatever's latest on PyPI today."
@@ -193,7 +226,7 @@ triggered by routine pushes:
 
 - **Linux**: reuses `packaging/linux/Dockerfile` unchanged (same
   Docker-in-Docker build as the local instructions above) — same
-  glibc-2.31 floor, same symlink-bug fix, same pinned versions.
+  glibc-2.39 / Ubuntu 24.04 floor, same symlink-bug fix, same pinned versions.
 - **macOS**: plain `pyinstaller --onefile`, no custom `.spec`. Confirmed by
   direct local testing (2026-08-28, Apple Silicon, Python 3.14) that
   PyInstaller performs an analogous top-level-symlink duplication here too
@@ -245,49 +278,23 @@ internal use.
 - By default, cameras are captured **sequentially, one at a time** (camera
   2's images are taken right after camera 1 finishes, not at the same
   instant) — "simultaneously connected" here means multiple cameras attached
-  to the machine at once, not hardware-synchronized/time-paired shots. This
-  is still exactly true for the CLI, and for the GUI when every camera's
-  Group field (below) is left blank.
+  to the machine at once, not hardware-synchronized/time-paired shots. The
+  GUI session path (v1.3.0+) always captures this way into a shared dated
+  shot folder.
 - Exposure and other acquisition settings are never modified by the
-  default (non-`--gui`) flow — the script only captures with whatever is
-  already configured on each camera. `--gui` only exposes an Exposure field
-  to adjust (via "Apply Settings") — there's no Gain field, since it's
-  virtually always left at 0 in practice; a camera's existing Gain setting
-  (whatever Pylon Viewer last configured) is left completely untouched.
-- **Camera groups (GUI only):** each camera row in `--gui` has a small
-  "Group" field, blank by default. Cameras that share the same Group value
-  fire together as one hardware-synchronized batch — IEEE 1588 PTP clock
-  sync brings the grouped cameras' clocks into agreement, then a broadcast
-  GigE Vision Scheduled Action Command fires `FrameStart` on all of them at
-  the same scheduled instant, once per requested shot — and their images
-  are saved together into ONE shared folder, `<outdir>/group_<label>/`,
-  instead of each camera getting its own subfolder (filenames still embed
-  each camera's model+serial, so files never collide inside the shared
-  folder). Different groups still run one after another, in the order they
-  first appear among the checked cameras. A camera left in its own group
-  (the default) is completely unaffected — no PTP/trigger writes happen for
-  it, its output folder is unchanged, and it runs through the exact same
-  code path as before this feature existed.
-  **Requirements:** every camera in a group must be GigE (not USB3, not an
-  emulated `PYLON_CAMEMU` device) and must support PTP (`PtpEnable` on ace 2
-  cameras, `GevIEEE1588` on ace Classic cameras) — the mechanism cannot be
-  exercised against the emulator at all. A grouped camera gets PTP and
-  trigger parameters written to it as part of opting into synchronized
-  capture — a new, narrowly-scoped exception to the "never writes
-  acquisition parameters" rule above. If PTP fails to converge (default
-  timeout: 90s) or an Action Command is rejected, the failure is reported as
-  a per-camera error in the status line rather than silently falling back to
-  unsynced capture; trigger configuration is always restored to its
-  pre-capture state afterward (in a `finally` block), even on failure.
-- **Lens info (GUI only):** each camera row has a second line for Lens
-  (mm)/Brand/Model — pure session documentation, all three optional, never
-  written to the camera. If any are filled in, they're recorded in a
-  `capture_manifest.json` in that camera's output folder (or the shared
-  group folder, one entry per camera, for a grouped run) — an appended
-  list, so re-running captures into the same folder over time adds entries
-  rather than overwriting history. Lens (mm), if filled in, must parse as a
-  positive number or Capture is blocked with a warning; Brand/Model have no
-  validation at all.
+  default flow — the script only captures with whatever is already
+  configured on each camera (set in Pylon Viewer). The GUI no longer
+  exposes Exposure / Apply Settings; a camera's existing Gain setting is
+  left completely untouched.
+- **GUI session fields:** Plate Color and Bolts Size are recorded in each
+  shot folder's `capture_manifest.json` alongside per-camera file lists.
+  See the Usage section above for folder layout and camera aliases.
+- **Hardware-synchronized group capture (library / historical):** the
+  module still contains IEEE 1588 PTP + GigE Vision Scheduled Action
+  Command helpers (`capture_group_synchronized`), but they are **not**
+  wired through the current GUI. They require GigE cameras with PTP
+  support and cannot be exercised against `PYLON_CAMEMU`. See older
+  CHANGELOG entries (1.0–1.1) for the original Group-field workflow.
 - TIFF and PNG output preserve bit depth above 8-bit when the camera's
   current pixel format supports it (e.g. Mono12 → a genuine 16-bit file);
   BMP output is always 8-bit. A warning is logged if the chosen format

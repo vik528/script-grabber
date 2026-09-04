@@ -3,7 +3,7 @@ name: Build standalone executables
 # Runs the same three-platform build this project has already validated by
 # hand: Linux via the existing Docker image (packaging/linux/Dockerfile,
 # reused as-is rather than reimplemented as native runner steps — it already
-# encodes the glibc-2.31 floor and the PyInstaller symlink-bug fix), macOS
+# encodes the Ubuntu 24.04 / glibc-2.39 floor and the PyInstaller symlink-bug fix), macOS
 # and Windows as native PyInstaller builds on GitHub-hosted runners.
 #
 # Version pins for pypylon/pyinstaller/pyinstaller-hooks-contrib are kept in
