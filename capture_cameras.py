@@ -36,7 +36,7 @@ import queue
 import re
 import sys
 import threading
-from typing import Optional
+from typing import NamedTuple, Optional
 
 try:
     from pypylon import pylon
@@ -53,6 +53,38 @@ except ImportError:
 
 LOG = logging.getLogger("capture_cameras")
 RETRIEVE_TIMEOUT_MS = 5000
+
+# Bounded retry budget for failed/incomplete buffers. A GigE buffer underrun
+# or dropped packet costs an attempt but not a saved frame, so allow some
+# headroom over `count` — but stay bounded: sustained packet loss must end
+# the run with a reported shortfall, not spin forever.
+GRAB_ATTEMPT_MULTIPLIER = 2
+
+
+class CaptureResult(NamedTuple):
+    """What one camera actually produced, against what was asked of it.
+
+    The whole point of this type is that `saved` alone is ambiguous — a list
+    of 3 filenames looks identical whether 3 or 10 images were requested.
+    Callers decide with `.ok`, and report with `.summary()`.
+    """
+
+    saved: list
+    requested: int
+    error: Optional[str] = None
+    serial: str = ""
+
+    @property
+    def shortfall(self) -> int:
+        return max(0, self.requested - len(self.saved))
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.shortfall == 0
+
+    def summary(self) -> str:
+        head = f"{self.serial}: {len(self.saved)}/{self.requested} saved"
+        return head if self.error is None else f"{head} — {self.error}"
 
 FILE_FORMATS = {
     "tiff": pylon.ImageFileFormat_Tiff,
@@ -91,14 +123,37 @@ def camera_file_stem(serial: str, model: str) -> str:
     return f"{sanitize(model)}_{serial}"
 
 
+def _write_json_atomic(path: str, payload) -> None:
+    """Write JSON via a temp file in the same directory, then os.replace.
+
+    A plain open(path, "w") truncates first, so an interrupted write left a
+    file that exists, is non-empty, and fails to parse — and every caller
+    swallows the error, so the corruption surfaced later as a mystery.
+    os.replace is atomic within a filesystem, so a reader sees either the
+    old file or the new one, never a half-written one.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_shot_manifest(folder: str, entry: dict) -> None:
     """Write one Capture's session object to <folder>/capture_manifest.json
     (overwrite). Used by the GUI dated-shot path. Never raises to the caller."""
     path = os.path.join(folder, "capture_manifest.json")
     try:
         os.makedirs(folder, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(entry, f, indent=2)
+        _write_json_atomic(path, entry)
     except Exception:
         LOG.exception("failed to write %s", path)
 
@@ -288,7 +343,7 @@ def log_camera_state(camera, label: str) -> None:
 
 def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=None,
                          shared_dir: Optional[str] = None,
-                         file_stem: Optional[str] = None) -> list:
+                         file_stem: Optional[str] = None) -> CaptureResult:
     """Grab `count` frames and save them.
 
     CLI / default path (no `shared_dir` / `file_stem`): writes into
@@ -300,7 +355,12 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
     `{file_stem}_{shot:03d}.{fmt}` inside that shared folder — no
     per-camera subfolder, no timestamp in the filename.
 
-    Returns the list of filenames saved (basename only).
+    Returns a CaptureResult reporting what was saved AGAINST what was asked
+    for. It never raises for a per-camera failure — an unopenable camera or
+    a mid-grab error comes back as `.error` with whatever was already
+    written to disk still listed in `.saved`, so the caller can neither miss
+    the failure nor lose the record of real files. Callers must consult
+    `.ok`; a bare `.saved` cannot distinguish 10-of-10 from 3-of-10.
     """
     serial = camera.DeviceInfo.GetSerialNumber()
     model = sanitize(camera.DeviceInfo.GetModelName())
@@ -308,10 +368,12 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
         cam_dir = shared_dir
     else:
         cam_dir = os.path.join(outdir, f"{model}_{serial}")
-    os.makedirs(cam_dir, exist_ok=True)
     saved: list = []
+    error: Optional[str] = None
+    failed_grabs = 0
 
     try:
+        os.makedirs(cam_dir, exist_ok=True)
         try:
             camera.Open()
         except Exception as e:
@@ -324,15 +386,25 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
         log_camera_state(camera, "on-open")
         converter = build_converter(camera)
 
-        camera.StartGrabbingMax(count)
-        shot = 0
+        # Drive the loop on frames SAVED, not frames retrieved.
+        # StartGrabbingMax(count) bounds retrievals, so every incomplete
+        # buffer used to burn one of the N slots and the loop exited short
+        # — silently, since a short list is indistinguishable from a full
+        # one. Grab open-endedly instead and stop at the target, with a
+        # bounded attempt budget so sustained packet loss terminates rather
+        # than spinning forever.
+        camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+        max_attempts = max(count * GRAB_ATTEMPT_MULTIPLIER, count + 3)
+        attempts = 0
         warned_bit_depth = False
-        while camera.IsGrabbing():
+        while len(saved) < count and attempts < max_attempts and camera.IsGrabbing():
+            attempts += 1
             try:
                 with camera.RetrieveResult(
                     RETRIEVE_TIMEOUT_MS, pylon.TimeoutHandling_ThrowException
                 ) as grab_result:
                     if not grab_result.GrabSucceeded():
+                        failed_grabs += 1
                         LOG.warning("%s: grab error %#x %s", serial,
                                     grab_result.ErrorCode, grab_result.ErrorDescription)
                         continue
@@ -348,7 +420,7 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
                             )
                         warned_bit_depth = True
 
-                    shot += 1
+                    shot = len(saved) + 1
                     if file_stem:
                         filename = f"{file_stem}_{shot:03d}.{fmt}"
                     else:
@@ -357,17 +429,43 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
                     converted.Save(FILE_FORMATS[fmt], os.path.join(cam_dir, filename))
                     saved.append(filename)
                     if progress_cb:
-                        progress_cb(shot, count)
+                        progress_cb(len(saved), count)
             except pylon.TimeoutException as e:
-                LOG.error("%s: grab timeout: %s", serial, e)
+                error = f"grab timeout after {len(saved)}/{count}: {e}"
+                LOG.error("%s: %s", serial, error)
                 break
+            except Exception as e:
+                # Previously only TimeoutException was caught, so a full disk
+                # (ENOSPC on Save) or a dropped link (genicam.RuntimeException)
+                # propagated out and discarded the record of frames already
+                # written. Keep the record; report the failure.
+                error = f"failed after {len(saved)}/{count}: {e}"
+                LOG.exception("%s: %s", serial, error)
+                break
+        if error is None and len(saved) < count:
+            error = (
+                f"saved {len(saved)} of {count} requested "
+                f"({failed_grabs} failed grab(s) in {attempts} attempts)"
+            )
+            LOG.error("%s: %s", serial, error)
         log_camera_state(camera, "post-grab")
+    except Exception as e:
+        error = str(e)
+        LOG.error("%s: %s", serial, error)
     finally:
-        if camera.IsGrabbing():
-            camera.StopGrabbing()
-        if camera.IsOpen():
-            camera.Close()
-    return saved
+        # Each guarded separately: an exception from StopGrabbing must not
+        # skip Close(), and neither must replace the error being reported.
+        try:
+            if camera.IsGrabbing():
+                camera.StopGrabbing()
+        except Exception:
+            LOG.exception("%s: StopGrabbing failed", serial)
+        try:
+            if camera.IsOpen():
+                camera.Close()
+        except Exception:
+            LOG.exception("%s: Close failed", serial)
+    return CaptureResult(saved=saved, requested=count, error=error, serial=str(serial))
 
 
 
@@ -390,21 +488,46 @@ def run_cli(args: argparse.Namespace) -> int:
         count = resolve_count(args.count)
         fmt = resolve_format(args.format)
         outdir = resolve_outdir(args.outdir)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         print(f"ERROR: {e}")
         return 1
+    except EOFError:
+        # A resolver fell back to input() with no stdin — the usual cause is
+        # a partially-flagged invocation under cron/systemd/CI.
+        print("ERROR: no input available for an omitted option. Pass "
+              "--cameras, --count, --format and --outdir explicitly when "
+              "running non-interactively.")
+        return 1
 
+    results: list = []
     for idx in indices:
+        serial = str(devices[idx].GetSerialNumber())
         print(f"Capturing {count} image(s) from {devices[idx].GetModelName()} "
-              f"(S/N {devices[idx].GetSerialNumber()})...")
+              f"(S/N {serial})...")
         try:
             camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[idx]))
-            capture_from_camera(camera, count, fmt, outdir)
+            results.append(capture_from_camera(camera, count, fmt, outdir))
         except Exception as e:
-            LOG.error("Failed capturing from %s: %s", devices[idx].GetSerialNumber(), e)
+            LOG.error("Failed capturing from %s: %s", serial, e)
             print(f"  ERROR: {e}")
+            results.append(CaptureResult(saved=[], requested=count,
+                                          error=str(e), serial=serial))
 
-    print("Done.")
+    # Report what happened per camera, and let the exit code carry it. A run
+    # that saved nothing used to print "Done." and exit 0, so a wrapper like
+    # `capture_cameras ... && rsync ...` archived an empty directory as a
+    # success.
+    print()
+    for r in results:
+        print(f"  {'ok  ' if r.ok else 'FAIL'}  {r.summary()}")
+
+    failed = [r for r in results if not r.ok]
+    total_saved = sum(len(r.saved) for r in results)
+    if failed:
+        print(f"\n{len(failed)} of {len(results)} camera(s) failed or came up "
+              f"short — {total_saved} image(s) saved. See messages above.")
+        return 1
+    print(f"\nDone. {total_saved} image(s) saved from {len(results)} camera(s).")
     return 0
 
 
@@ -526,8 +649,7 @@ def _save_ui_prefs(prefs: dict) -> None:
     path = _ui_prefs_path()
     try:
         os.makedirs(_ui_config_dir(), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, indent=2)
+        _write_json_atomic(path, prefs)
     except Exception:
         LOG.exception("failed to write %s", path)
 
@@ -684,7 +806,11 @@ def run_gui() -> int:
                 canvas, 0, 0, max(w - off, 1), max(h - off, 1), radius,
                 fill=fill, outline="", tags="chrome",
             )
-            canvas.lower()
+            # tkinter aliases Canvas.lower to tag_lower (lower a canvas ITEM),
+            # so the bare canvas.lower() this used to call raised TclError
+            # "wrong # args" on every <Configure> of every panel, and the
+            # widget was never restacked. Misc.lower is the widget operation.
+            tk.Misc.lower(canvas)
 
         outer.bind("<Configure>", _redraw)
         return outer, inner
@@ -704,10 +830,16 @@ def run_gui() -> int:
             highlightthickness=0, bd=0, cursor="hand2",
         )
         hover = [False]
+        enabled = [True]
 
         def draw(_event=None):
             cnv.delete("all")
-            if kind == "solid":
+            if not enabled[0]:
+                # Muted, no hover, no pointer cursor — the button must LOOK
+                # inert while a capture runs, not just ignore clicks.
+                _canvas_round_rect(cnv, 0, 0, w, h, r, fill=DORI_BORDER, outline="")
+                cnv.create_text(w / 2, h / 2, text=text, fill=DORI_MUTED, font=pill_font)
+            elif kind == "solid":
                 fill = DORI_PRIMARY_HOVER if hover[0] else DORI_PRIMARY
                 _canvas_round_rect(cnv, 0, 0, w, h, r, fill=fill, outline="")
                 cnv.create_text(w / 2, h / 2, text=text, fill="#FFFFFF", font=pill_font)
@@ -722,9 +854,16 @@ def run_gui() -> int:
                 )
                 cnv.create_text(w / 2, h / 2, text=text, fill=DORI_NAVY, font=pill_font)
 
-        cnv.bind("<Enter>", lambda _e: (hover.__setitem__(0, True), draw()))
+        def set_enabled(on: bool):
+            enabled[0] = bool(on)
+            hover[0] = False
+            cnv.configure(cursor="hand2" if on else "")
+            draw()
+
+        cnv.bind("<Enter>", lambda _e: enabled[0] and (hover.__setitem__(0, True), draw()))
         cnv.bind("<Leave>", lambda _e: (hover.__setitem__(0, False), draw()))
-        cnv.bind("<Button-1>", lambda _e: command())
+        cnv.bind("<Button-1>", lambda _e: command() if enabled[0] else None)
+        cnv.set_enabled = set_enabled  # type: ignore[attr-defined]
         draw()
         return cnv
 
@@ -733,6 +872,13 @@ def run_gui() -> int:
     )
     ui_queue: "queue.Queue" = queue.Queue()
     capturing = [False]  # list-boxed so nested functions can mutate it without `nonlocal`
+    capture_btn = [None]  # the Capture pill, once built (see set_capture_enabled)
+
+    def set_capture_enabled(on: bool):
+        """Single owner of the Capture button's enabled state, so the button,
+        the `capturing` flag and the Rescan guard cannot disagree."""
+        if capture_btn[0] is not None:
+            capture_btn[0].set_enabled(on)
 
     cam_vars = []
 
@@ -823,6 +969,19 @@ def run_gui() -> int:
     refresh_logo()
 
     tk.Frame(root, bg=DORI_PRIMARY, height=2).pack(fill="x")
+
+    # NOTE ON PACK ORDER: the control bar and status line are packed to the
+    # bottom BEFORE `content` claims the remaining space with expand=True.
+    # Packed after it, pack reserved nothing for them, so the growing camera
+    # list and preview strip pushed them out of the window entirely — with
+    # three cameras the status line was already unmapped at the default
+    # 900x640, and after a capture the Capture/Rescan bar went with it,
+    # leaving no way to start another run. The placeholders below are filled
+    # in further down, once their callbacks exist.
+    status_row = tk.Frame(root, bg=DORI_BG)
+    status_row.pack(side="bottom", fill="x", padx=28, pady=(0, 12))
+    bar_slot = tk.Frame(root, bg=DORI_BG)
+    bar_slot.pack(side="bottom", fill="x")
 
     content = tk.Frame(root, bg=DORI_BG)
     content.pack(fill="both", expand=True, padx=28, pady=(20, 16))
@@ -994,89 +1153,141 @@ def run_gui() -> int:
     # Capture runs in a worker thread; Tk widgets must only ever be touched
     # from the main thread, so the worker pushes status strings onto a queue
     # that a root.after loop drains on the GUI thread.
-    def worker(indices, count, outdir, plate_color, bolts_size):
-        now = datetime.datetime.now()
-        date_folder = now.strftime("%m-%d")
-        # One folder per plate/bolts combo under the date, then one shot
-        # folder per Capture click — so opening MM-DD shows Black_Big /
-        # Silver_Small / etc., and each press nests under the matching combo.
-        combo_folder = f"{sanitize(plate_color)}_{sanitize(bolts_size)}"
-        time_folder = now.strftime("%H%M%S")
-        shot_folder = os.path.join(outdir, date_folder, combo_folder, time_folder)
-        os.makedirs(shot_folder, exist_ok=True)
-        ui_queue.put(f"Shot folder: {shot_folder}")
+    def worker(chosen_devices, count, outdir, plate_color, bolts_size):
+        # `chosen_devices` is a snapshot taken on the main thread, not indices
+        # into the shared `devices` list — Rescan replaces that list in place,
+        # and indexing it from here raced with that.
+        failures: list = []
+        cameras_meta: list = []
+        shot_folder = None
+        try:
+            now = datetime.datetime.now()
+            # Year included: %m-%d alone made lexical and chronological order
+            # diverge across a year boundary, and an anniversary-date shot
+            # landed in the previous year's combo folder.
+            date_folder = now.strftime("%Y-%m-%d")
+            # One folder per plate/bolts combo under the date, then one shot
+            # folder per Capture click — so opening a date shows Black_Big /
+            # Silver_Small / etc., and each press nests under the matching combo.
+            combo_folder = f"{sanitize(plate_color)}_{sanitize(bolts_size)}"
+            time_folder = now.strftime("%H%M%S")
+            shot_folder = os.path.join(outdir, date_folder, combo_folder, time_folder)
+            os.makedirs(shot_folder, exist_ok=True)
+            ui_queue.put(f"Shot folder: {shot_folder}")
 
-        fmt = "bmp"
-        cameras_meta = []
-        for idx in indices:
-            d = devices[idx]
-            serial = str(d.GetSerialNumber())
-            model_raw = d.GetModelName()
-            model = sanitize(model_raw)
-            alias = camera_alias(serial)
-            stem = camera_file_stem(serial, model_raw)
-            label = alias or model_raw
+            fmt = "bmp"
 
-            def cb(shot, total, label=label):
-                ui_queue.put(f"{label}: {shot}/{total}")
+            def flush_manifest():
+                """Rewritten after every camera, so a run that is interrupted
+                — window closed, process killed — still leaves a record of
+                what those BMPs are of."""
+                write_shot_manifest(shot_folder, {
+                    "plate_color": plate_color,
+                    "bolts_size": bolts_size,
+                    "combo_folder": combo_folder,
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "shot_folder": shot_folder,
+                    "cameras": cameras_meta,
+                    "count": count,
+                    "format": fmt,
+                    "complete": len(cameras_meta) == len(chosen_devices),
+                })
 
-            files = []
-            try:
-                cam = pylon.InstantCamera(tl_factory.CreateDevice(d))
-                files = capture_from_camera(
-                    cam, count, fmt, outdir, progress_cb=cb,
-                    shared_dir=shot_folder, file_stem=stem,
-                )
-            except Exception as e:
-                ui_queue.put(f"{label}: ERROR {e}")
+            for d in chosen_devices:
+                serial = str(d.GetSerialNumber())
+                model_raw = d.GetModelName()
+                alias = camera_alias(serial)
+                stem = camera_file_stem(serial, model_raw)
+                label = alias or model_raw
 
-            display_alias = alias or stem
-            cameras_meta.append({
-                "serial": serial,
-                "model": model_raw,
-                "alias": display_alias,
-                "files": files,
-            })
+                def cb(shot, total, label=label):
+                    ui_queue.put(f"{label}: {shot}/{total}")
 
-            # JPEG preview from the first saved BMP (Alias_001.bmp). File I/O
-            # stays on this worker thread; only the path is handed to Tk.
-            if files:
-                if not _PIL_AVAILABLE:
-                    ui_queue.put("__NO_PILLOW__")
-                else:
-                    bmp_path = os.path.join(shot_folder, files[0])
-                    jpeg_path = os.path.join(
-                        shot_folder, f"preview_{display_alias}.jpg",
+                try:
+                    cam = pylon.InstantCamera(tl_factory.CreateDevice(d))
+                    result = capture_from_camera(
+                        cam, count, fmt, outdir, progress_cb=cb,
+                        shared_dir=shot_folder, file_stem=stem,
                     )
-                    if _bmp_to_preview_jpeg(bmp_path, jpeg_path):
-                        ui_queue.put(("__PREVIEW__", display_alias, jpeg_path))
+                except Exception as e:
+                    result = CaptureResult(saved=[], requested=count,
+                                            error=str(e), serial=serial)
 
-        write_shot_manifest(shot_folder, {
-            "plate_color": plate_color,
-            "bolts_size": bolts_size,
-            "combo_folder": combo_folder,
-            "timestamp": now.isoformat(timespec="seconds"),
-            "shot_folder": shot_folder,
-            "cameras": cameras_meta,
-            "count": count,
-            "format": fmt,
-        })
-        ui_queue.put("__DONE__")
+                files = result.saved
+                if not result.ok:
+                    failures.append(f"{label}: {result.error}")
+                    ui_queue.put(f"{label}: ERROR {result.error}")
+
+                display_alias = alias or stem
+                cameras_meta.append({
+                    "serial": serial,
+                    "model": model_raw,
+                    "alias": display_alias,
+                    "files": files,
+                    "requested": count,
+                    "saved": len(files),
+                    "error": result.error,
+                })
+                flush_manifest()
+
+                # JPEG preview from the first saved BMP (Alias_001.bmp). File
+                # I/O stays on this worker thread; only the path is handed to Tk.
+                if files:
+                    if not _PIL_AVAILABLE:
+                        ui_queue.put("__NO_PILLOW__")
+                    else:
+                        bmp_path = os.path.join(shot_folder, files[0])
+                        jpeg_path = os.path.join(
+                            shot_folder, f"preview_{display_alias}.jpg",
+                        )
+                        if _bmp_to_preview_jpeg(bmp_path, jpeg_path):
+                            ui_queue.put(("__PREVIEW__", display_alias, jpeg_path))
+        except Exception as e:
+            # Anything outside the per-camera try — creating the shot folder
+            # on a read-only mount, most likely. This used to kill the thread
+            # before __DONE__, stranding capturing[0] True for the life of the
+            # process and blocking Rescan forever.
+            LOG.exception("capture worker failed")
+            failures.append(f"capture failed: {e}")
+        finally:
+            # __DONE__ in a finally, always, whatever happened above.
+            ui_queue.put(("__DONE__", failures))
 
     def poll_queue():
         try:
             while True:
                 msg = ui_queue.get_nowait()
-                if msg == "__DONE__":
+                # The completion sentinel carries the run's failures with it.
+                # Reporting them through status_var alone could never work:
+                # this loop drains the whole queue inside one Tk callback and
+                # Tk does not redraw mid-callback, so every error string was
+                # overwritten by "Capture complete." before it was ever painted.
+                if isinstance(msg, tuple) and msg and msg[0] == "__DONE__":
                     capturing[0] = False
-                    status_var.set("Capture complete.")
-                elif msg == "__NO_PILLOW__":
-                    if not pillow_warned[0]:
-                        pillow_warned[0] = True
+                    set_capture_enabled(True)
+                    failures = msg[1] if len(msg) > 1 else []
+                    if failures:
                         status_var.set(
-                            "Pillow not installed — JPEG previews skipped. "
-                            "Capture still works."
+                            f"Capture finished with {len(failures)} error(s): "
+                            + "; ".join(failures)
                         )
+                        messagebox.showerror(
+                            "Capture incomplete",
+                            f"{len(failures)} of the selected cameras failed or "
+                            "saved fewer images than requested:\n\n"
+                            + "\n".join(failures),
+                        )
+                    elif pillow_warned[0]:
+                        status_var.set(
+                            "Capture complete. Pillow not installed — JPEG "
+                            "previews skipped."
+                        )
+                    else:
+                        status_var.set("Capture complete.")
+                elif msg == "__NO_PILLOW__":
+                    # Latch only; the message is folded into the completion
+                    # line above, which is the one that survives the drain.
+                    pillow_warned[0] = True
                 elif (
                     isinstance(msg, tuple)
                     and len(msg) == 3
@@ -1088,9 +1299,14 @@ def run_gui() -> int:
                     status_var.set(msg)
         except queue.Empty:
             pass
-        root.after(100, poll_queue)
+        finally:
+            # In a finally so a raise while draining cannot silently kill the
+            # polling loop and freeze every future status update.
+            root.after(100, poll_queue)
 
     def start_capture():
+        if capturing[0]:
+            return  # a capture is already running; the button is disabled too
         indices = [i for i, v in enumerate(cam_vars) if v.get()]
         if not indices:
             messagebox.showwarning("No cameras", "Select at least one camera.")
@@ -1103,15 +1319,37 @@ def run_gui() -> int:
             messagebox.showwarning("Invalid count", "Count must be a positive integer.")
             return
 
-        main_outdir = outdir_var.get().strip() or os.path.abspath("./captures")
+        main_outdir = os.path.expanduser(outdir_var.get().strip()) or os.path.abspath("./captures")
+        main_outdir = os.path.abspath(main_outdir)
         outdir_var.set(main_outdir)
-        os.makedirs(main_outdir, exist_ok=True)
+        try:
+            os.makedirs(main_outdir, exist_ok=True)
+            # exist_ok short-circuits on an existing directory without testing
+            # writability, so an existing read-only folder passed this check
+            # and then failed in the worker instead.
+            if not os.access(main_outdir, os.W_OK):
+                raise PermissionError(f"not writable: {main_outdir}")
+        except OSError as e:
+            messagebox.showerror(
+                "Cannot use that folder",
+                f"{main_outdir}\n\n{e}\n\nPick a different output folder.",
+            )
+            return
+
+        # Snapshot the chosen devices now, on the main thread; Rescan mutates
+        # the shared `devices` list and the worker must not index into it.
+        chosen = [devices[i] for i in indices if i < len(devices)]
+        if not chosen:
+            messagebox.showwarning("No cameras", "Select at least one camera.")
+            return
+
         capturing[0] = True
+        set_capture_enabled(False)
         _clear_preview_strip()  # refill as each camera finishes
         threading.Thread(
             target=worker,
             args=(
-                indices, count, main_outdir,
+                chosen, count, main_outdir,
                 plate_color_var.get(), bolts_size_var.get(),
             ),
             daemon=True,
@@ -1133,7 +1371,7 @@ def run_gui() -> int:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
 
     bar, bar_inner = _rounded_panel(
-        root, fill=DORI_CARD, radius=16, shadow=True, canvas_bg=DORI_BG,
+        bar_slot, fill=DORI_CARD, radius=16, shadow=True, canvas_bg=DORI_BG,
     )
     bar.pack(fill="x", padx=28, pady=(0, 8))
     bar_pad = tk.Frame(bar_inner, bg=DORI_CARD)
@@ -1165,15 +1403,14 @@ def run_gui() -> int:
 
     row2 = tk.Frame(bar_pad, bg=DORI_CARD)
     row2.pack(fill="x", pady=(14, 0))
-    _pill_button(
+    capture_btn[0] = _pill_button(
         row2, "Capture", start_capture, kind="solid", canvas_bg=DORI_CARD,
-    ).pack(side="right")
+    )
+    capture_btn[0].pack(side="right")
     _pill_button(
         row2, "Rescan", rescan, kind="outline", canvas_bg=DORI_CARD,
     ).pack(side="right", padx=(0, 10))
 
-    status_row = tk.Frame(root, bg=DORI_BG)
-    status_row.pack(fill="x", padx=28, pady=(0, 12))
     status_label = tk.Label(
         status_row, textvariable=status_var, anchor="w", justify="left",
         bg=DORI_BG, fg=_status_annotation_color(status_var.get()),
@@ -1192,6 +1429,24 @@ def run_gui() -> int:
             status_label.configure(wraplength=wrap)
 
     root.bind("<Configure>", _on_root_configure)
+
+    def _on_close():
+        # The capture worker is a daemon thread: closing the window returns
+        # from mainloop and the interpreter stops it wherever it happens to
+        # be. The shot manifest is now rewritten after every camera, so an
+        # interrupted run still documents what it captured — but confirm
+        # anyway rather than silently truncating a run in progress.
+        if capturing[0]:
+            if not messagebox.askokcancel(
+                "Capture in progress",
+                "A capture is still running. Closing now stops it — images "
+                "already written stay on disk and the shot manifest records "
+                "what completed.\n\nClose anyway?",
+            ):
+                return
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
 
     poll_queue()
     root.mainloop()
