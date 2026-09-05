@@ -6,9 +6,14 @@ capture_cameras.py — Multi-camera capture utility for Basler cameras
 Auto-detects every Basler camera pypylon can see, lets you pick which ones to
 use, and captures a chosen number of images from each. Camera settings
 (exposure, gain, etc.) are left exactly as configured in Pylon Viewer — this
-script never writes acquisition parameters in its default (CLI) flow. Run
-with --gui for an optional session-oriented window (plate/bolts fields,
-BMP-only, dated shot folders, fixed camera aliases — see README).
+script never writes acquisition parameters at all. Run with --gui for an
+optional session-oriented window (plate/bolts fields, BMP-only, dated shot
+folders, fixed camera aliases — see README).
+
+Exit codes: 0 = every selected camera saved every requested image; 1 = a
+camera failed to open, errored mid-capture, or saved fewer images than
+requested (also: no cameras found, bad arguments, pypylon missing);
+130 = interrupted.
 
 Usage:
     python3 capture_cameras.py
@@ -20,7 +25,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 import argparse
 import datetime
@@ -31,12 +36,10 @@ import queue
 import re
 import sys
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import NamedTuple, Optional
 
 try:
-    from pypylon import pylon, genicam
+    from pypylon import pylon
 except ImportError:
     sys.stderr.write(
         "ERROR: pypylon is not installed, or the Pylon SDK runtime could not "
@@ -50,6 +53,39 @@ except ImportError:
 
 LOG = logging.getLogger("capture_cameras")
 RETRIEVE_TIMEOUT_MS = 5000
+
+# Bounded retry budget for failed/incomplete buffers. A GigE buffer underrun
+# or dropped packet costs an attempt but not a saved frame, so allow some
+# headroom over `count` — but stay bounded: sustained packet loss must end
+# the run with a reported shortfall, not spin forever.
+GRAB_ATTEMPT_MULTIPLIER = 2
+
+
+class CaptureResult(NamedTuple):
+    """What one camera actually produced, against what was asked of it.
+
+    The whole point of this type is that `saved` alone is ambiguous — a list
+    of 3 filenames looks identical whether 3 or 10 images were requested.
+    Callers decide with `.ok`, and report with `.summary()`.
+    """
+
+    saved: list
+    requested: int
+    error: Optional[str] = None
+    serial: str = ""
+
+    @property
+    def shortfall(self) -> int:
+        return max(0, self.requested - len(self.saved))
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and self.shortfall == 0
+
+    def summary(self) -> str:
+        head = f"{self.serial}: {len(self.saved)}/{self.requested} saved"
+        return head if self.error is None else f"{head} — {self.error}"
+
 
 FILE_FORMATS = {
     "tiff": pylon.ImageFileFormat_Tiff,
@@ -88,28 +124,28 @@ def camera_file_stem(serial: str, model: str) -> str:
     return f"{sanitize(model)}_{serial}"
 
 
-def append_manifest_entry(folder: str, entry: dict) -> None:
-    """Append one entry to <folder>/capture_manifest.json (created as an
-    empty list if absent) — session documentation only (lens info, group
-    membership), never anything read back or used to drive capture. Never
-    raises to the caller: a manifest write failure must not abort a capture
-    that otherwise succeeded."""
-    path = os.path.join(folder, "capture_manifest.json")
+def _write_json_atomic(path: str, payload) -> None:
+    """Write JSON via a temp file in the same directory, then os.replace.
+
+    A plain open(path, "w") truncates first, so an interrupted write left a
+    file that exists, is non-empty, and fails to parse — and every caller
+    swallows the error, so the corruption surfaced later as a mystery.
+    os.replace is atomic within a filesystem, so a reader sees either the
+    old file or the new one, never a half-written one.
+    """
+    tmp = f"{path}.tmp"
     try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            data = []
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except Exception:
-        LOG.exception("could not read existing %s — starting a fresh list", path)
-        data = []
-    data.append(entry)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception:
-        LOG.exception("failed to write %s", path)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_shot_manifest(folder: str, entry: dict) -> None:
@@ -118,8 +154,7 @@ def write_shot_manifest(folder: str, entry: dict) -> None:
     path = os.path.join(folder, "capture_manifest.json")
     try:
         os.makedirs(folder, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(entry, f, indent=2)
+        _write_json_atomic(path, entry)
     except Exception:
         LOG.exception("failed to write %s", path)
 
@@ -180,29 +215,6 @@ def resolve_camera_selection(devices: list, cli_value: Optional[str]) -> list:
         if not (0 <= idx < len(devices)):
             raise ValueError(f"Camera index {idx} is out of range (0-{len(devices) - 1}).")
     return indices
-
-
-def partition_into_groups(indices: list, group_of) -> list:
-    """Partition `indices` (already filtered to checked/selected cameras)
-    into ordered sub-lists sharing the same Group field value, in order of
-    first appearance. `group_of(idx)` returns the raw (string) Group value
-    for that camera index. Blank/whitespace-only values are each their own
-    singleton group — the zero-interaction default, identical to today's
-    flat per-camera iteration order.
-
-    Keying blank values by (True, idx) rather than a sentinel string makes
-    collision with a user-typed group label impossible.
-    """
-    groups_by_key: dict = {}
-    order = []
-    for idx in indices:
-        raw = (group_of(idx) or "").strip()
-        key = (True, idx) if not raw else (False, raw)
-        if key not in groups_by_key:
-            groups_by_key[key] = []
-            order.append(key)
-        groups_by_key[key].append(idx)
-    return [groups_by_key[key] for key in order]
 
 
 # ---------------------------------------------------------------------------
@@ -331,9 +343,8 @@ def log_camera_state(camera, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=None,
-                         lens_info: Optional[dict] = None,
                          shared_dir: Optional[str] = None,
-                         file_stem: Optional[str] = None) -> list:
+                         file_stem: Optional[str] = None) -> CaptureResult:
     """Grab `count` frames and save them.
 
     CLI / default path (no `shared_dir` / `file_stem`): writes into
@@ -345,10 +356,12 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
     `{file_stem}_{shot:03d}.{fmt}` inside that shared folder — no
     per-camera subfolder, no timestamp in the filename.
 
-    `lens_info`, if given, is {"mm", "brand", "model"} session documentation
-    appended via append_manifest_entry (legacy; GUI session capture writes
-    its own shot-level manifest instead). Returns the list of filenames
-    saved (basename only).
+    Returns a CaptureResult reporting what was saved AGAINST what was asked
+    for. It never raises for a per-camera failure — an unopenable camera or
+    a mid-grab error comes back as `.error` with whatever was already
+    written to disk still listed in `.saved`, so the caller can neither miss
+    the failure nor lose the record of real files. Callers must consult
+    `.ok`; a bare `.saved` cannot distinguish 10-of-10 from 3-of-10.
     """
     serial = camera.DeviceInfo.GetSerialNumber()
     model = sanitize(camera.DeviceInfo.GetModelName())
@@ -356,10 +369,12 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
         cam_dir = shared_dir
     else:
         cam_dir = os.path.join(outdir, f"{model}_{serial}")
-    os.makedirs(cam_dir, exist_ok=True)
     saved: list = []
+    error: Optional[str] = None
+    failed_grabs = 0
 
     try:
+        os.makedirs(cam_dir, exist_ok=True)
         try:
             camera.Open()
         except Exception as e:
@@ -372,15 +387,25 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
         log_camera_state(camera, "on-open")
         converter = build_converter(camera)
 
-        camera.StartGrabbingMax(count)
-        shot = 0
+        # Drive the loop on frames SAVED, not frames retrieved.
+        # StartGrabbingMax(count) bounds retrievals, so every incomplete
+        # buffer used to burn one of the N slots and the loop exited short
+        # — silently, since a short list is indistinguishable from a full
+        # one. Grab open-endedly instead and stop at the target, with a
+        # bounded attempt budget so sustained packet loss terminates rather
+        # than spinning forever.
+        camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+        max_attempts = max(count * GRAB_ATTEMPT_MULTIPLIER, count + 3)
+        attempts = 0
         warned_bit_depth = False
-        while camera.IsGrabbing():
+        while len(saved) < count and attempts < max_attempts and camera.IsGrabbing():
+            attempts += 1
             try:
                 with camera.RetrieveResult(
                     RETRIEVE_TIMEOUT_MS, pylon.TimeoutHandling_ThrowException
                 ) as grab_result:
                     if not grab_result.GrabSucceeded():
+                        failed_grabs += 1
                         LOG.warning("%s: grab error %#x %s", serial,
                                     grab_result.ErrorCode, grab_result.ErrorDescription)
                         continue
@@ -396,7 +421,7 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
                             )
                         warned_bit_depth = True
 
-                    shot += 1
+                    shot = len(saved) + 1
                     if file_stem:
                         filename = f"{file_stem}_{shot:03d}.{fmt}"
                     else:
@@ -405,573 +430,45 @@ def capture_from_camera(camera, count: int, fmt: str, outdir: str, progress_cb=N
                     converted.Save(FILE_FORMATS[fmt], os.path.join(cam_dir, filename))
                     saved.append(filename)
                     if progress_cb:
-                        progress_cb(shot, count)
+                        progress_cb(len(saved), count)
             except pylon.TimeoutException as e:
-                LOG.error("%s: grab timeout: %s", serial, e)
+                error = f"grab timeout after {len(saved)}/{count}: {e}"
+                LOG.error("%s: %s", serial, error)
                 break
+            except Exception as e:
+                # Previously only TimeoutException was caught, so a full disk
+                # (ENOSPC on Save) or a dropped link (genicam.RuntimeException)
+                # propagated out and discarded the record of frames already
+                # written. Keep the record; report the failure.
+                error = f"failed after {len(saved)}/{count}: {e}"
+                LOG.exception("%s: %s", serial, error)
+                break
+        if error is None and len(saved) < count:
+            error = (
+                f"saved {len(saved)} of {count} requested "
+                f"({failed_grabs} failed grab(s) in {attempts} attempts)"
+            )
+            LOG.error("%s: %s", serial, error)
         log_camera_state(camera, "post-grab")
-        if lens_info is not None:
-            append_manifest_entry(cam_dir, {
-                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                "serial": serial, "model": model,
-                "count": count, "format": fmt,
-                "lens_mm": lens_info.get("mm"), "lens_brand": lens_info.get("brand"),
-                "lens_model": lens_info.get("model"),
-                "synchronized": False, "group_label": None,
-            })
+    except Exception as e:
+        error = str(e)
+        LOG.error("%s: %s", serial, error)
     finally:
-        if camera.IsGrabbing():
-            camera.StopGrabbing()
-        if camera.IsOpen():
-            camera.Close()
-    return saved
-
-
-# ---------------------------------------------------------------------------
-# Hardware-synchronized group capture (GUI-only; a camera Group of size >= 2)
-#
-# Uses IEEE 1588 PTP clock sync + GigE Vision Scheduled Action Commands to
-# fire FrameStart on every camera in a group at (as close to) the same
-# instant. This is the one deliberate, narrowly-scoped exception to the
-# script's "never writes acquisition parameters" rule — and only for
-# cameras a human explicitly placed in a shared Group via the GUI; a camera
-# left in its own group never has any of this code run against it.
-#
-# Node names below (PtpEnable vs. GevIEEE1588, GevIEEE1588Status,
-# PtpServoStatus, GevIEEE1588OffsetFromMaster, ActionDeviceKey/GroupKey/
-# GroupMask, TriggerSource="Action1", etc.) are sourced from Basler's
-# official docs and pypylon's own source/tests, not guessed.
-# ---------------------------------------------------------------------------
-
-class HardwareSyncError(RuntimeError):
-    """Raised internally; always caught at the top level of
-    capture_group_synchronized and turned into a per-camera error string —
-    never propagates to the caller."""
-
-
-class PtpConvergenceError(HardwareSyncError):
-    pass
-
-
-class ActionCommandError(HardwareSyncError):
-    pass
-
-
-PTP_ENABLE_NODE_CANDIDATES = ("PtpEnable", "GevIEEE1588")           # a2A vs. acA
-PTP_LATCH_NODE_CANDIDATES = ("PtpDataSetLatch", "GevIEEE1588DataSetLatch")
-PTP_STATUS_NODE_CANDIDATES = ("PtpStatus", "GevIEEE1588Status")     # a2A vs. acA — confirmed
-                                                                      # against real hardware to
-                                                                      # split the same way as the
-                                                                      # enable node, contrary to
-                                                                      # this session's earlier
-                                                                      # (wrong) research summary
-TIMESTAMP_LATCH_NODE_CANDIDATES = ("TimestampLatch", "GevTimestampControlLatch")
-TIMESTAMP_VALUE_NODE_CANDIDATES = ("TimestampLatchValue", "GevTimestampValue")
-PTP_OFFSET_NODE_CANDIDATES = ("PtpOffsetFromMaster", "GevIEEE1588OffsetFromMaster")  # a2A vs. acA
-
-PTP_OFFSET_THRESHOLD_NS = 1_000_000         # 1 ms
-OFFSET_WINDOW_SAMPLES = 5                    # MAX over this many polls — not monotonic
-PTP_CONVERGENCE_TIMEOUT_S = 90.0             # Basler: "a few seconds or minutes" — no fixed sleep
-PTP_POLL_INTERVAL_S = 0.5
-
-ACTION_DEVICE_KEY = 1
-ACTION_GROUP_KEY = 1
-ACTION_GROUP_MASK = pylon.AllGroupMask       # 0xffffffff
-ACTION_TIME_MARGIN_NS = 500_000_000          # 500 ms; doubled on _ActionLate retry, capped
-ACTION_TIME_MARGIN_CAP_NS = 4_000_000_000
-ACTION_TIME_MARGIN_FLOOR_NS = 100_000_000    # never shrink below this
-ACTION_TIME_MARGIN_SHRINK_AFTER = 3          # consecutive clean rounds before shrinking
-ACTION_TIME_MARGIN_SHRINK_FACTOR = 0.7
-SCHEDULED_ACTION_ISSUE_TIMEOUT_MS = 2000
-
-# --- Reliability/throughput tuning for grouped (simultaneous) capture only —
-# the solo/sequential path has no simultaneous-burst bandwidth contention, so
-# it's deliberately left untouched. Confirmed against real hardware (pypylon
-# 26.7, emulated device): MaxNumBuffer defaults to 10 and is genuinely
-# settable pre-grab. AutoPacketSize lives on the STREAM GRABBER node map
-# (camera.GetStreamGrabberNodeMap(), not the device node map, and not via a
-# GetStreamGrabberParams() method — that attribute exists but is a
-# non-callable PlaceholderParameter in this pypylon version) — confirmed
-# absent entirely on the emulator's stream grabber (architecturally
-# expected: packet-size negotiation is meaningless without real network
-# transport), so this could only be probe-tested, not proven, without real
-# GigE hardware — verify it's actually available on real cameras before
-# trusting it silently no-ops. GevSCBWA (bandwidth assigned) is a device-node
-# reading, also unavailable on the emulator for the same reason.
-GROUP_MIN_NUM_BUFFER = 16
-GIGE_LINK_BANDWIDTH_BYTES_PER_SEC = 125_000_000   # ~125 MB/s per 1GigE link
-                                                    # (Basler AW00144501000)
-BANDWIDTH_WARNING_FRACTION = 0.85
-
-
-def probe_node(camera, names):
-    """First candidate that exists AND is available on this camera —
-    distinct from read_node()'s IsReadable(), which is about a specific
-    reading, not 'does this camera line even expose this feature.'
-
-    Confirmed against real hardware: there is no IsAvailable() *method* on
-    pypylon's typed parameter objects (BooleanParameter/EnumParameter/etc.)
-    — that's the C++ GenApi::IsAvailable(node) free function's Python
-    binding, exposed as genicam.IsAvailable(node), not node.IsAvailable().
-    Calling the (nonexistent) method silently AttributeErrors, which an
-    earlier version of this function swallowed via a bare except — making
-    every real PTP node look "not found" even when it was fully available.
-    """
-    for n in names:
-        node = getattr(camera, n, None)
-        if node is not None:
-            try:
-                if genicam.IsAvailable(node):
-                    return n, node
-            except Exception:
-                continue
-    return None, None
-
-
-# --- Trigger-state snapshot / restore ("never leave a camera stuck") -------
-#
-# pypylon's InstantCamera registers CAcquireContinuousConfiguration by
-# default on Open(), which forces TriggerMode=Off/AcquisitionMode=Continuous
-# — so the snapshot taken right after Open() reflects that default, not
-# necessarily whatever was configured in Pylon Viewer before. That's fine:
-# TriggerMode=Off is exactly the safe restore target, and it's what every
-# existing run of this script already leaves a camera in.
-
-def _snapshot_trigger_state(camera) -> dict:
-    return {
-        "TriggerSelector": read_node(camera.TriggerSelector),
-        "TriggerMode": read_node(camera.TriggerMode),
-        "TriggerSource": read_node(camera.TriggerSource),
-    }
-
-
-def _restore_trigger_state(camera, state: dict, serial: str) -> None:
-    # Runs in a finally block — must never raise.
-    try:
-        for name in ("TriggerSelector", "TriggerMode", "TriggerSource"):
-            val = state.get(name)
-            if val is not None:
-                getattr(camera, name).TrySetValue(val)
-    except Exception:
-        LOG.exception("%s: failed to restore trigger state", serial)
-
-
-def _configure_action_trigger(camera, serial: str) -> None:
-    camera.TriggerSelector.SetValue("FrameStart")
-    camera.TriggerMode.SetValue("On")
-    camera.TriggerSource.SetValue("Action1")
-    camera.ActionDeviceKey.SetValue(ACTION_DEVICE_KEY)
-    camera.ActionGroupKey.SetValue(ACTION_GROUP_KEY)
-    camera.ActionGroupMask.SetValue(ACTION_GROUP_MASK)
-    # Written directly (not via pylon.ActionTriggerConfiguration, whose
-    # TriggerSelector coverage was never confirmed) — read back to verify
-    # our own writes actually stuck before trusting them.
-    if read_node(camera.TriggerMode) != "On" or read_node(camera.TriggerSource) != "Action1":
-        raise ActionCommandError(f"{serial}: trigger config did not take effect")
-
-
-def _configure_group_streaming(camera, serial: str, log_cb=None) -> None:
-    """Best-effort reliability tuning for one camera in a synchronized group,
-    called once per camera right before StartGrabbingMax(). Never raises —
-    a failure here should degrade to "less robust against bandwidth
-    contention," not abort an otherwise-working capture. Neither setting
-    needs restoring afterward: both are host-side StreamGrabber session
-    parameters, not persisted to the camera, so a fresh Open() next time
-    reverts to pylon's own defaults on its own.
-    """
-    try:
-        if genicam.IsAvailable(camera.MaxNumBuffer) and camera.MaxNumBuffer.GetValue() < GROUP_MIN_NUM_BUFFER:
-            camera.MaxNumBuffer.SetValue(GROUP_MIN_NUM_BUFFER)
-    except Exception:
-        LOG.exception("%s: could not raise MaxNumBuffer", serial)
-
-    try:
-        sg_nodemap = camera.GetStreamGrabberNodeMap()
-        auto_packet_size = sg_nodemap.GetNode("AutoPacketSize")
-        if auto_packet_size is not None and genicam.IsAvailable(auto_packet_size):
-            auto_packet_size.SetValue(True)
-        elif log_cb:
-            log_cb(f"{serial}: AutoPacketSize not available on this camera/transport — "
-                   "skipping (only expected on real GigE hardware, not the emulator)")
-    except Exception:
-        LOG.exception("%s: could not enable AutoPacketSize", serial)
-
-
-def _check_group_bandwidth(cameras, serials, log_cb=None) -> None:
-    """Non-blocking diagnostic: sums each camera's current GevSCBWA (actual
-    bandwidth demand at its current settings) and warns via log_cb if the
-    group's combined demand looks tight against one GigE link's ~125MB/s
-    budget. This is exactly the Basler-documented mechanism (AW00144501000)
-    for predicting the bandwidth-contention failure mode this whole feature
-    is trying to make more robust against — a warning, not a hard gate,
-    since the math is a heuristic (doesn't account for GevSCPD/GevSCFTD
-    tuning that might already mitigate it) and GevSCBWA may simply be
-    unavailable (e.g. on the emulator — never blocks capture either way).
-    """
-    total = 0
-    readable = {}
-    for cam, serial in zip(cameras, serials):
+        # Each guarded separately: an exception from StopGrabbing must not
+        # skip Close(), and neither must replace the error being reported.
         try:
-            node = getattr(cam, "GevSCBWA", None)
-            if node is not None and genicam.IsAvailable(node):
-                val = read_node(node)
-                if val is not None:
-                    readable[serial] = val
-                    total += val
+            if camera.IsGrabbing():
+                camera.StopGrabbing()
         except Exception:
-            LOG.exception("%s: could not read GevSCBWA", serial)
-
-    if not readable:
-        return  # nothing readable (e.g. emulator) — no basis for a warning
-    threshold = GIGE_LINK_BANDWIDTH_BYTES_PER_SEC * BANDWIDTH_WARNING_FRACTION
-    if total > threshold and log_cb:
-        log_cb(
-            f"bandwidth warning: this group's combined GevSCBWA is "
-            f"{total / 1e6:.1f} MB/s ({readable}) — exceeds "
-            f"{BANDWIDTH_WARNING_FRACTION:.0%} of one GigE link's ~125MB/s budget. "
-            "If cameras share one switch/NIC, this can cause buffer underruns "
-            "during synchronized capture (see README's Ubuntu network tuning notes)."
-        )
+            LOG.exception("%s: StopGrabbing failed", serial)
+        try:
+            if camera.IsOpen():
+                camera.Close()
+        except Exception:
+            LOG.exception("%s: Close failed", serial)
+    return CaptureResult(saved=saved, requested=count, error=error, serial=str(serial))
 
 
-# --- PTP enable + shared-deadline convergence poll --------------------------
-#
-# Enable PTP on every camera first (fast), then poll all cameras together
-# against one shared deadline — polling one camera to completion before even
-# enabling the next would let it converge against a partial view of the PTP
-# domain.
-
-def _enable_ptp(camera, serial: str) -> None:
-    name, node = probe_node(camera, PTP_ENABLE_NODE_CANDIDATES)
-    if node is None:
-        raise PtpConvergenceError(f"{serial}: no PTP-enable node found")
-    if not node.TrySetValue(True):
-        raise PtpConvergenceError(f"{serial}: camera rejected enabling {name}")
-
-
-def _wait_group_ptp_converged(cameras, serials, log_cb=None,
-                               timeout_s=PTP_CONVERGENCE_TIMEOUT_S,
-                               poll_interval_s=PTP_POLL_INTERVAL_S) -> dict:
-    """Returns {serial: last_observed_status} once every camera reaches a
-    converged state (Master, or Slave/Uncalibrated with lock confirmed).
-    Raises PtpConvergenceError on timeout or a Faulty status."""
-    per_cam = {}
-    for cam, serial in zip(cameras, serials):
-        _, status_node = probe_node(cam, PTP_STATUS_NODE_CANDIDATES)
-        if status_node is None:
-            raise PtpConvergenceError(f"{serial}: no PTP status node found")
-        per_cam[serial] = {
-            "latch": probe_node(cam, PTP_LATCH_NODE_CANDIDATES)[1],
-            "status": status_node,
-            "servo": probe_node(cam, ("PtpServoStatus",))[1],
-            "offset": probe_node(cam, PTP_OFFSET_NODE_CANDIDATES)[1],
-            "window": [], "last_status": None,
-        }
-
-    pending = set(serials)
-    deadline = time.monotonic() + timeout_s
-    while pending and time.monotonic() < deadline:
-        for serial in list(pending):
-            st = per_cam[serial]
-            if st["latch"] is not None:
-                st["latch"].Execute()
-            status = read_node(st["status"])
-            st["last_status"] = status
-
-            if status == "Faulty":
-                raise PtpConvergenceError(f"{serial}: PTP status is Faulty")
-            if status in (None, "Initializing", "Listening", "Pre_Master"):
-                continue
-            if status == "Master":
-                pending.discard(serial)           # terminal, converged state
-                continue
-            # Slave/Uncalibrated: check actual lock quality.
-            if st["servo"] is not None:
-                if read_node(st["servo"]) == "Locked":
-                    pending.discard(serial)
-            elif st["offset"] is not None:
-                off = read_node(st["offset"])
-                if off is not None:
-                    w = st["window"]
-                    w.append(abs(off))
-                    del w[:-OFFSET_WINDOW_SAMPLES]
-                    if len(w) >= OFFSET_WINDOW_SAMPLES and max(w) < PTP_OFFSET_THRESHOLD_NS:
-                        pending.discard(serial)
-            elif status == "Slave":
-                pending.discard(serial)           # weakest fallback: no servo/offset node at all
-
-        if log_cb:
-            log_cb(f"PTP convergence: waiting on {sorted(pending) or 'none — converged'}")
-        if pending:
-            time.sleep(poll_interval_s)
-
-    if pending:
-        raise PtpConvergenceError(
-            f"PTP did not converge within {timeout_s}s for: {sorted(pending)}"
-        )
-    return {s: per_cam[s]["last_status"] for s in serials}
-
-
-def _select_reference_clock(statuses: dict) -> str:
-    """Pick the elected grandmaster (status == 'Master') as the camera whose
-    latched timestamp action_time_ns is computed from. Also doubles as the
-    split-domain check: >1 Master means a broken L2 segment."""
-    masters = [s for s, v in statuses.items() if v == "Master"]
-    if len(masters) > 1:
-        raise PtpConvergenceError(
-            f"split PTP domain — multiple masters {masters} (statuses={statuses}); "
-            "confirm all grouped cameras are on the same L2 segment/switch"
-        )
-    if not masters:
-        raise PtpConvergenceError(f"no camera reached Master status (statuses={statuses})")
-    return masters[0]
-
-
-CLOCK_AGREEMENT_TOLERANCE_NS = 500_000_000  # 500 ms — generous on purpose; see below.
-
-
-def _read_camera_timestamp_ns(camera, serial: str) -> int:
-    _, latch_node = probe_node(camera, TIMESTAMP_LATCH_NODE_CANDIDATES)
-    _, value_node = probe_node(camera, TIMESTAMP_VALUE_NODE_CANDIDATES)
-    if latch_node is None or value_node is None:
-        raise HardwareSyncError(f"{serial}: no timestamp-latch node found")
-    latch_node.Execute()
-    return value_node.GetValue()
-
-
-def _verify_clock_agreement(cameras, serials) -> None:
-    """Sanity-check, once per group right after PTP convergence, that the
-    TimestampLatch/Value nodes we'll actually schedule against agree with
-    each other across every camera in the group.
-
-    Confirmed against real hardware (a2A4200/a2A4504/acA4112): once PTP is
-    enabled and converged, TimestampLatchValue/GevTimestampValue tick at a
-    genuine real-time nanosecond rate and agree within single-digit
-    milliseconds across cameras — but they are NOT Unix-epoch nanoseconds.
-    Per the GigE Vision spec, this node is device-relative (reset at
-    power-up/reset), not wall-clock-based; PTP disciplines its rate and
-    cross-device agreement, not its zero point. An earlier version of this
-    function checked `timestamp >= 10**17` as a proxy for "is this real PTP
-    time" — that assumption was wrong and would reject every legitimate
-    reading from real Basler hardware. The check that actually matches the
-    risk being guarded against (scheduling against a camera whose
-    TimestampLatch isn't truly disciplined by the same PTP domain, despite
-    its status/offset nodes self-reporting convergence) is cross-camera
-    agreement, checked here directly.
-    """
-    readings = {serial: _read_camera_timestamp_ns(cam, serial) for cam, serial in zip(cameras, serials)}
-    spread = max(readings.values()) - min(readings.values())
-    if spread > CLOCK_AGREEMENT_TOLERANCE_NS:
-        raise HardwareSyncError(
-            f"grouped cameras' timestamps disagree by {spread / 1e6:.1f}ms "
-            f"(readings={readings}) — exceeds {CLOCK_AGREEMENT_TOLERANCE_NS / 1e6:.0f}ms "
-            "tolerance; refusing to schedule against an inconsistent clock"
-        )
-
-
-def _next_action_time_ns(ref_camera, ref_serial: str, margin_ns: int) -> int:
-    now_ns = _read_camera_timestamp_ns(ref_camera, ref_serial)
-    return now_ns + margin_ns
-
-
-# --- Per-shot round loop (respects the acA's 1-deep action queue) ----------
-#
-# pypylon's grab engine fills its own buffer queue in the background once
-# StartGrabbingMax is active — the concurrency need isn't "poll N cameras in
-# parallel to avoid dropped frames," it's "never let a slow/timed-out
-# RetrieveResult cause scheduling round k+1 while round k might still be
-# outstanding on the acA (1-deep queue, no ActionQueueSize node at all)."
-
-def _make_capture_ctx(camera, serial: str, fmt: str, outdir: str,
-                       shared_dir: Optional[str] = None) -> dict:
-    """`shared_dir`, if given, is used as this camera's output directory
-    instead of its own `<model>_<serial>` subfolder — how a Group's cameras
-    end up saving into one shared folder together."""
-    model = sanitize(camera.DeviceInfo.GetModelName())
-    cam_dir = shared_dir if shared_dir else os.path.join(outdir, f"{model}_{serial}")
-    os.makedirs(cam_dir, exist_ok=True)
-    return {
-        "camera": camera, "serial": serial, "model": model, "cam_dir": cam_dir,
-        "converter": build_converter(camera), "fmt": fmt, "shot_counter": 0,
-    }
-
-
-def _retrieve_and_save_one(ctx: dict, timeout_ms: int):
-    cam = ctx["camera"]
-    try:
-        with cam.RetrieveResult(timeout_ms, pylon.TimeoutHandling_ThrowException) as gr:
-            if not gr.GrabSucceeded():
-                return ("grab_error", f"{gr.ErrorCode:#x} {gr.ErrorDescription}")
-            converted = ctx["converter"].Convert(gr)
-            ctx["shot_counter"] += 1
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = f"{ctx['model']}_{ctx['serial']}_{ctx['shot_counter']:04d}_{ts}.{ctx['fmt']}"
-            converted.Save(FILE_FORMATS[ctx["fmt"]], os.path.join(ctx["cam_dir"], filename))
-            return ("ok", filename)
-    except pylon.TimeoutException as e:
-        return ("timeout", str(e))
-
-
-def _issue_action_and_collect_round(executor, ctxs, gige_tl, action_time_ns,
-                                     timeout_ms, expected_ok_count, broadcast_address):
-    # Submit RetrieveResult futures BEFORE the broadcast so every camera is
-    # already blocked-and-waiting when the hardware trigger actually fires.
-    futures = {ctx["serial"]: executor.submit(_retrieve_and_save_one, ctx, timeout_ms) for ctx in ctxs}
-    ok, raw_results = gige_tl.IssueScheduledActionCommandWait(
-        ACTION_DEVICE_KEY, ACTION_GROUP_KEY, ACTION_GROUP_MASK,
-        action_time_ns, broadcast_address, SCHEDULED_ACTION_ISSUE_TIMEOUT_MS, expected_ok_count,
-    )
-    # raw_results' list-to-device ordering was never confirmed against real
-    # hardware — log it as an aggregate signal only. Per-camera outcomes
-    # come entirely from RetrieveResult, which is unambiguous.
-    outcomes = {serial: f.result() for serial, f in futures.items()}
-    return ok, raw_results, outcomes
-
-
-def capture_group_synchronized(cameras, serials, count, fmt, outdir,
-                                progress_cb=None, log_cb=None,
-                                broadcast_address="255.255.255.255",
-                                group_label: str = "",
-                                lens_info: Optional[dict] = None) -> dict:
-    """Hardware-synchronized capture for one Group's cameras (size >= 2).
-    Never raises to the caller — catches HardwareSyncError internally and
-    records it per-camera, matching the existing per-camera try/except
-    pattern used elsewhere in this script (e.g. run_cli's capture loop).
-    Returns {serial: {"shots_saved": int, "error": Optional[str]}}.
-
-    `group_label` (the raw Group field text) names the ONE shared output
-    directory every camera in this group saves into — this is what makes a
-    synchronized shot set land together instead of split across per-camera
-    subfolders. `lens_info`, if given, is {serial: {"mm", "brand", "model"}}
-    — session documentation only (see append_manifest_entry), never written
-    to any camera.
-    """
-    results = {s: {"shots_saved": 0, "error": None} for s in serials}
-    ctxs, gige_tl, snapshots, shared_dir = [], None, {}, None
-    try:
-        # 1. Early GigE gate (before any Open()) — the whole mechanism is
-        #    GigE Vision Action Commands; fail fast on a USB3/emulated camera
-        #    rather than deep inside PTP convergence after wasted opens.
-        for cam in cameras:
-            device_class = cam.GetDeviceInfo().GetDeviceClass()
-            if device_class != "BaslerGigE":
-                raise HardwareSyncError(
-                    "all grouped cameras must be GigE for hardware sync "
-                    f"(found {device_class})"
-                )
-        # 2. Open, snapshot, build per-camera output contexts — all sharing
-        #    one directory named after this group's label.
-        shared_dir = os.path.join(outdir, f"group_{sanitize(group_label)}") if group_label else outdir
-        os.makedirs(shared_dir, exist_ok=True)
-        for cam, serial in zip(cameras, serials):
-            cam.Open()
-            snapshots[serial] = _snapshot_trigger_state(cam)
-            ctxs.append(_make_capture_ctx(cam, serial, fmt, outdir, shared_dir=shared_dir))
-        # 3. Enable + converge PTP, then discover the elected reference clock.
-        for cam, serial in zip(cameras, serials):
-            _enable_ptp(cam, serial)
-        statuses = _wait_group_ptp_converged(cameras, serials, log_cb=log_cb)
-        ref_serial = _select_reference_clock(statuses)
-        ref_camera = dict(zip(serials, cameras))[ref_serial]
-        _verify_clock_agreement(cameras, serials)
-        _check_group_bandwidth(cameras, serials, log_cb=log_cb)
-        # 4. Configure Action-Command triggering + reliability tuning, arm
-        #    grabbing on every camera.
-        for cam, serial in zip(cameras, serials):
-            _configure_action_trigger(cam, serial)
-            _configure_group_streaming(cam, serial, log_cb=log_cb)
-            cam.StartGrabbingMax(count)
-        # 5. Per-shot round loop: one broadcast Action Command per shot,
-        #    waiting for every camera's frame before advancing.
-        gige_tl = pylon.TlFactory.GetInstance().CreateTl(pylon.BaslerGigEDeviceClass)
-        with ThreadPoolExecutor(max_workers=len(cameras)) as executor:
-            margin_ns = ACTION_TIME_MARGIN_NS
-            clean_rounds = 0   # consecutive rounds with no _ActionLate retry and no drop
-            shot_idx = 1
-            while shot_idx <= count:
-                action_time_ns = _next_action_time_ns(ref_camera, ref_serial, margin_ns)
-                ok, raw, outcomes = _issue_action_and_collect_round(
-                    executor, ctxs, gige_tl, action_time_ns,
-                    RETRIEVE_TIMEOUT_MS, len(cameras), broadcast_address,
-                )
-                if log_cb:
-                    log_cb(f"shot {shot_idx}/{count}: command_ok={ok} raw={raw} outcomes={outcomes} "
-                           f"margin_ns={margin_ns}")
-                if not ok:
-                    if "_ActionLate" in str(raw) and margin_ns < ACTION_TIME_MARGIN_CAP_NS:
-                        margin_ns = min(margin_ns * 2, ACTION_TIME_MARGIN_CAP_NS)
-                        clean_rounds = 0
-                        continue   # retry same shot_idx with a bigger margin
-                    for s in serials:
-                        results[s]["error"] = results[s]["error"] or (
-                            f"shot {shot_idx}: action command not accepted ({raw})"
-                        )
-                    break
-                failed = {s: v for s, v in outcomes.items() if v[0] != "ok"}
-                for s, (status, info) in outcomes.items():
-                    if status == "ok":
-                        results[s]["shots_saved"] += 1
-                        if progress_cb:
-                            progress_cb(s, shot_idx, count)
-                    else:
-                        results[s]["error"] = f"shot {shot_idx}: {status} ({info})"
-                if failed:
-                    # A dropped frame means we can't be sure the acA's
-                    # single-deep action queue is clear — continuing risks
-                    # _Overflow or misattributing a late frame to the wrong
-                    # shot index. Abort remaining shots; already-saved shots
-                    # for every camera stay on disk.
-                    if log_cb:
-                        log_cb(f"aborting remaining shots after shot {shot_idx}: {failed}")
-                    break
-                # Every camera in this round reported "ok" with no
-                # _ActionLate retry needed — a genuinely clean round. After
-                # enough of these in a row, the margin is provably more
-                # generous than this network/hardware actually needs, so
-                # shrink it (bounded by a floor) to cut per-shot overhead on
-                # long runs. Any future _ActionLate immediately grows it back.
-                clean_rounds += 1
-                if clean_rounds >= ACTION_TIME_MARGIN_SHRINK_AFTER and margin_ns > ACTION_TIME_MARGIN_FLOOR_NS:
-                    margin_ns = max(int(margin_ns * ACTION_TIME_MARGIN_SHRINK_FACTOR), ACTION_TIME_MARGIN_FLOOR_NS)
-                    clean_rounds = 0
-                shot_idx += 1
-    except HardwareSyncError as e:
-        for s in serials:
-            if results[s]["error"] is None:
-                results[s]["error"] = str(e)
-    finally:
-        for ctx in ctxs:
-            cam, serial = ctx["camera"], ctx["serial"]
-            try:
-                if cam.IsGrabbing():
-                    cam.StopGrabbing()
-            except Exception:
-                LOG.exception("%s: StopGrabbing failed", serial)
-            if serial in snapshots:
-                _restore_trigger_state(cam, snapshots[serial], serial)
-            try:
-                if cam.IsOpen():
-                    cam.Close()
-            except Exception:
-                LOG.exception("%s: Close failed", serial)
-        if gige_tl is not None:
-            pylon.TlFactory.GetInstance().ReleaseTl(gige_tl)
-    if lens_info is not None and ctxs:
-        manifest_dir = shared_dir or outdir
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        for ctx in ctxs:
-            serial, model = ctx["serial"], ctx["model"]
-            info = lens_info.get(serial) or {}
-            append_manifest_entry(manifest_dir, {
-                "timestamp": ts, "serial": serial, "model": model,
-                "count": count, "format": fmt,
-                "lens_mm": info.get("mm"), "lens_brand": info.get("brand"),
-                "lens_model": info.get("model"),
-                "synchronized": True, "group_label": group_label or None,
-                "shots_saved": results[serial]["shots_saved"],
-                "error": results[serial]["error"],
-            })
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -992,21 +489,46 @@ def run_cli(args: argparse.Namespace) -> int:
         count = resolve_count(args.count)
         fmt = resolve_format(args.format)
         outdir = resolve_outdir(args.outdir)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         print(f"ERROR: {e}")
         return 1
+    except EOFError:
+        # A resolver fell back to input() with no stdin — the usual cause is
+        # a partially-flagged invocation under cron/systemd/CI.
+        print("ERROR: no input available for an omitted option. Pass "
+              "--cameras, --count, --format and --outdir explicitly when "
+              "running non-interactively.")
+        return 1
 
+    results: list = []
     for idx in indices:
+        serial = str(devices[idx].GetSerialNumber())
         print(f"Capturing {count} image(s) from {devices[idx].GetModelName()} "
-              f"(S/N {devices[idx].GetSerialNumber()})...")
+              f"(S/N {serial})...")
         try:
             camera = pylon.InstantCamera(tl_factory.CreateDevice(devices[idx]))
-            capture_from_camera(camera, count, fmt, outdir)
+            results.append(capture_from_camera(camera, count, fmt, outdir))
         except Exception as e:
-            LOG.error("Failed capturing from %s: %s", devices[idx].GetSerialNumber(), e)
+            LOG.error("Failed capturing from %s: %s", serial, e)
             print(f"  ERROR: {e}")
+            results.append(CaptureResult(saved=[], requested=count,
+                                          error=str(e), serial=serial))
 
-    print("Done.")
+    # Report what happened per camera, and let the exit code carry it. A run
+    # that saved nothing used to print "Done." and exit 0, so a wrapper like
+    # `capture_cameras ... && rsync ...` archived an empty directory as a
+    # success.
+    print()
+    for r in results:
+        print(f"  {'ok  ' if r.ok else 'FAIL'}  {r.summary()}")
+
+    failed = [r for r in results if not r.ok]
+    total_saved = sum(len(r.saved) for r in results)
+    if failed:
+        print(f"\n{len(failed)} of {len(results)} camera(s) failed or came up "
+              f"short — {total_saved} image(s) saved. See messages above.")
+        return 1
+    print(f"\nDone. {total_saved} image(s) saved from {len(results)} camera(s).")
     return 0
 
 
@@ -1015,7 +537,7 @@ def run_cli(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Visual shell is Dori-branded (navy header, teal primary, gray page, white
 # rounded cards with pill controls). GUI capture is sequential into a shared
-# dated shot folder — no Group / PTP / Apply Settings path. CLI is unchanged.
+# dated shot folder. CLI is unchanged.
 
 try:
     from PIL import Image, ImageTk
@@ -1128,8 +650,7 @@ def _save_ui_prefs(prefs: dict) -> None:
     path = _ui_prefs_path()
     try:
         os.makedirs(_ui_config_dir(), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, indent=2)
+        _write_json_atomic(path, prefs)
     except Exception:
         LOG.exception("failed to write %s", path)
 
@@ -1286,7 +807,11 @@ def run_gui() -> int:
                 canvas, 0, 0, max(w - off, 1), max(h - off, 1), radius,
                 fill=fill, outline="", tags="chrome",
             )
-            canvas.lower()
+            # tkinter aliases Canvas.lower to tag_lower (lower a canvas ITEM),
+            # so the bare canvas.lower() this used to call raised TclError
+            # "wrong # args" on every <Configure> of every panel, and the
+            # widget was never restacked. Misc.lower is the widget operation.
+            tk.Misc.lower(canvas)
 
         outer.bind("<Configure>", _redraw)
         return outer, inner
@@ -1306,10 +831,16 @@ def run_gui() -> int:
             highlightthickness=0, bd=0, cursor="hand2",
         )
         hover = [False]
+        enabled = [True]
 
         def draw(_event=None):
             cnv.delete("all")
-            if kind == "solid":
+            if not enabled[0]:
+                # Muted, no hover, no pointer cursor — the button must LOOK
+                # inert while a capture runs, not just ignore clicks.
+                _canvas_round_rect(cnv, 0, 0, w, h, r, fill=DORI_BORDER, outline="")
+                cnv.create_text(w / 2, h / 2, text=text, fill=DORI_MUTED, font=pill_font)
+            elif kind == "solid":
                 fill = DORI_PRIMARY_HOVER if hover[0] else DORI_PRIMARY
                 _canvas_round_rect(cnv, 0, 0, w, h, r, fill=fill, outline="")
                 cnv.create_text(w / 2, h / 2, text=text, fill="#FFFFFF", font=pill_font)
@@ -1324,9 +855,16 @@ def run_gui() -> int:
                 )
                 cnv.create_text(w / 2, h / 2, text=text, fill=DORI_NAVY, font=pill_font)
 
-        cnv.bind("<Enter>", lambda _e: (hover.__setitem__(0, True), draw()))
+        def set_enabled(on: bool):
+            enabled[0] = bool(on)
+            hover[0] = False
+            cnv.configure(cursor="hand2" if on else "")
+            draw()
+
+        cnv.bind("<Enter>", lambda _e: enabled[0] and (hover.__setitem__(0, True), draw()))
         cnv.bind("<Leave>", lambda _e: (hover.__setitem__(0, False), draw()))
-        cnv.bind("<Button-1>", lambda _e: command())
+        cnv.bind("<Button-1>", lambda _e: command() if enabled[0] else None)
+        cnv.set_enabled = set_enabled  # type: ignore[attr-defined]
         draw()
         return cnv
 
@@ -1335,6 +873,13 @@ def run_gui() -> int:
     )
     ui_queue: "queue.Queue" = queue.Queue()
     capturing = [False]  # list-boxed so nested functions can mutate it without `nonlocal`
+    capture_btn = [None]  # the Capture pill, once built (see set_capture_enabled)
+
+    def set_capture_enabled(on: bool):
+        """Single owner of the Capture button's enabled state, so the button,
+        the `capturing` flag and the Rescan guard cannot disagree."""
+        if capture_btn[0] is not None:
+            capture_btn[0].set_enabled(on)
 
     cam_vars = []
 
@@ -1425,6 +970,19 @@ def run_gui() -> int:
     refresh_logo()
 
     tk.Frame(root, bg=DORI_PRIMARY, height=2).pack(fill="x")
+
+    # NOTE ON PACK ORDER: the control bar and status line are packed to the
+    # bottom BEFORE `content` claims the remaining space with expand=True.
+    # Packed after it, pack reserved nothing for them, so the growing camera
+    # list and preview strip pushed them out of the window entirely — with
+    # three cameras the status line was already unmapped at the default
+    # 900x640, and after a capture the Capture/Rescan bar went with it,
+    # leaving no way to start another run. The placeholders below are filled
+    # in further down, once their callbacks exist.
+    status_row = tk.Frame(root, bg=DORI_BG)
+    status_row.pack(side="bottom", fill="x", padx=28, pady=(0, 12))
+    bar_slot = tk.Frame(root, bg=DORI_BG)
+    bar_slot.pack(side="bottom", fill="x")
 
     content = tk.Frame(root, bg=DORI_BG)
     content.pack(fill="both", expand=True, padx=28, pady=(20, 16))
@@ -1596,89 +1154,141 @@ def run_gui() -> int:
     # Capture runs in a worker thread; Tk widgets must only ever be touched
     # from the main thread, so the worker pushes status strings onto a queue
     # that a root.after loop drains on the GUI thread.
-    def worker(indices, count, outdir, plate_color, bolts_size):
-        now = datetime.datetime.now()
-        date_folder = now.strftime("%m-%d")
-        # One folder per plate/bolts combo under the date, then one shot
-        # folder per Capture click — so opening MM-DD shows Black_Big /
-        # Silver_Small / etc., and each press nests under the matching combo.
-        combo_folder = f"{sanitize(plate_color)}_{sanitize(bolts_size)}"
-        time_folder = now.strftime("%H%M%S")
-        shot_folder = os.path.join(outdir, date_folder, combo_folder, time_folder)
-        os.makedirs(shot_folder, exist_ok=True)
-        ui_queue.put(f"Shot folder: {shot_folder}")
+    def worker(chosen_devices, count, outdir, plate_color, bolts_size):
+        # `chosen_devices` is a snapshot taken on the main thread, not indices
+        # into the shared `devices` list — Rescan replaces that list in place,
+        # and indexing it from here raced with that.
+        failures: list = []
+        cameras_meta: list = []
+        shot_folder = None
+        try:
+            now = datetime.datetime.now()
+            # Year included: %m-%d alone made lexical and chronological order
+            # diverge across a year boundary, and an anniversary-date shot
+            # landed in the previous year's combo folder.
+            date_folder = now.strftime("%Y-%m-%d")
+            # One folder per plate/bolts combo under the date, then one shot
+            # folder per Capture click — so opening a date shows Black_Big /
+            # Silver_Small / etc., and each press nests under the matching combo.
+            combo_folder = f"{sanitize(plate_color)}_{sanitize(bolts_size)}"
+            time_folder = now.strftime("%H%M%S")
+            shot_folder = os.path.join(outdir, date_folder, combo_folder, time_folder)
+            os.makedirs(shot_folder, exist_ok=True)
+            ui_queue.put(f"Shot folder: {shot_folder}")
 
-        fmt = "bmp"
-        cameras_meta = []
-        for idx in indices:
-            d = devices[idx]
-            serial = str(d.GetSerialNumber())
-            model_raw = d.GetModelName()
-            model = sanitize(model_raw)
-            alias = camera_alias(serial)
-            stem = camera_file_stem(serial, model_raw)
-            label = alias or model_raw
+            fmt = "bmp"
 
-            def cb(shot, total, label=label):
-                ui_queue.put(f"{label}: {shot}/{total}")
+            def flush_manifest():
+                """Rewritten after every camera, so a run that is interrupted
+                — window closed, process killed — still leaves a record of
+                what those BMPs are of."""
+                write_shot_manifest(shot_folder, {
+                    "plate_color": plate_color,
+                    "bolts_size": bolts_size,
+                    "combo_folder": combo_folder,
+                    "timestamp": now.isoformat(timespec="seconds"),
+                    "shot_folder": shot_folder,
+                    "cameras": cameras_meta,
+                    "count": count,
+                    "format": fmt,
+                    "complete": len(cameras_meta) == len(chosen_devices),
+                })
 
-            files = []
-            try:
-                cam = pylon.InstantCamera(tl_factory.CreateDevice(d))
-                files = capture_from_camera(
-                    cam, count, fmt, outdir, progress_cb=cb,
-                    shared_dir=shot_folder, file_stem=stem,
-                )
-            except Exception as e:
-                ui_queue.put(f"{label}: ERROR {e}")
+            for d in chosen_devices:
+                serial = str(d.GetSerialNumber())
+                model_raw = d.GetModelName()
+                alias = camera_alias(serial)
+                stem = camera_file_stem(serial, model_raw)
+                label = alias or model_raw
 
-            display_alias = alias or stem
-            cameras_meta.append({
-                "serial": serial,
-                "model": model_raw,
-                "alias": display_alias,
-                "files": files,
-            })
+                def cb(shot, total, label=label):
+                    ui_queue.put(f"{label}: {shot}/{total}")
 
-            # JPEG preview from the first saved BMP (Alias_001.bmp). File I/O
-            # stays on this worker thread; only the path is handed to Tk.
-            if files:
-                if not _PIL_AVAILABLE:
-                    ui_queue.put("__NO_PILLOW__")
-                else:
-                    bmp_path = os.path.join(shot_folder, files[0])
-                    jpeg_path = os.path.join(
-                        shot_folder, f"preview_{display_alias}.jpg",
+                try:
+                    cam = pylon.InstantCamera(tl_factory.CreateDevice(d))
+                    result = capture_from_camera(
+                        cam, count, fmt, outdir, progress_cb=cb,
+                        shared_dir=shot_folder, file_stem=stem,
                     )
-                    if _bmp_to_preview_jpeg(bmp_path, jpeg_path):
-                        ui_queue.put(("__PREVIEW__", display_alias, jpeg_path))
+                except Exception as e:
+                    result = CaptureResult(saved=[], requested=count,
+                                            error=str(e), serial=serial)
 
-        write_shot_manifest(shot_folder, {
-            "plate_color": plate_color,
-            "bolts_size": bolts_size,
-            "combo_folder": combo_folder,
-            "timestamp": now.isoformat(timespec="seconds"),
-            "shot_folder": shot_folder,
-            "cameras": cameras_meta,
-            "count": count,
-            "format": fmt,
-        })
-        ui_queue.put("__DONE__")
+                files = result.saved
+                if not result.ok:
+                    failures.append(f"{label}: {result.error}")
+                    ui_queue.put(f"{label}: ERROR {result.error}")
+
+                display_alias = alias or stem
+                cameras_meta.append({
+                    "serial": serial,
+                    "model": model_raw,
+                    "alias": display_alias,
+                    "files": files,
+                    "requested": count,
+                    "saved": len(files),
+                    "error": result.error,
+                })
+                flush_manifest()
+
+                # JPEG preview from the first saved BMP (Alias_001.bmp). File
+                # I/O stays on this worker thread; only the path is handed to Tk.
+                if files:
+                    if not _PIL_AVAILABLE:
+                        ui_queue.put("__NO_PILLOW__")
+                    else:
+                        bmp_path = os.path.join(shot_folder, files[0])
+                        jpeg_path = os.path.join(
+                            shot_folder, f"preview_{display_alias}.jpg",
+                        )
+                        if _bmp_to_preview_jpeg(bmp_path, jpeg_path):
+                            ui_queue.put(("__PREVIEW__", display_alias, jpeg_path))
+        except Exception as e:
+            # Anything outside the per-camera try — creating the shot folder
+            # on a read-only mount, most likely. This used to kill the thread
+            # before __DONE__, stranding capturing[0] True for the life of the
+            # process and blocking Rescan forever.
+            LOG.exception("capture worker failed")
+            failures.append(f"capture failed: {e}")
+        finally:
+            # __DONE__ in a finally, always, whatever happened above.
+            ui_queue.put(("__DONE__", failures))
 
     def poll_queue():
         try:
             while True:
                 msg = ui_queue.get_nowait()
-                if msg == "__DONE__":
+                # The completion sentinel carries the run's failures with it.
+                # Reporting them through status_var alone could never work:
+                # this loop drains the whole queue inside one Tk callback and
+                # Tk does not redraw mid-callback, so every error string was
+                # overwritten by "Capture complete." before it was ever painted.
+                if isinstance(msg, tuple) and msg and msg[0] == "__DONE__":
                     capturing[0] = False
-                    status_var.set("Capture complete.")
-                elif msg == "__NO_PILLOW__":
-                    if not pillow_warned[0]:
-                        pillow_warned[0] = True
+                    set_capture_enabled(True)
+                    failures = msg[1] if len(msg) > 1 else []
+                    if failures:
                         status_var.set(
-                            "Pillow not installed — JPEG previews skipped. "
-                            "Capture still works."
+                            f"Capture finished with {len(failures)} error(s): "
+                            + "; ".join(failures)
                         )
+                        messagebox.showerror(
+                            "Capture incomplete",
+                            f"{len(failures)} of the selected cameras failed or "
+                            "saved fewer images than requested:\n\n"
+                            + "\n".join(failures),
+                        )
+                    elif pillow_warned[0]:
+                        status_var.set(
+                            "Capture complete. Pillow not installed — JPEG "
+                            "previews skipped."
+                        )
+                    else:
+                        status_var.set("Capture complete.")
+                elif msg == "__NO_PILLOW__":
+                    # Latch only; the message is folded into the completion
+                    # line above, which is the one that survives the drain.
+                    pillow_warned[0] = True
                 elif (
                     isinstance(msg, tuple)
                     and len(msg) == 3
@@ -1690,9 +1300,14 @@ def run_gui() -> int:
                     status_var.set(msg)
         except queue.Empty:
             pass
-        root.after(100, poll_queue)
+        finally:
+            # In a finally so a raise while draining cannot silently kill the
+            # polling loop and freeze every future status update.
+            root.after(100, poll_queue)
 
     def start_capture():
+        if capturing[0]:
+            return  # a capture is already running; the button is disabled too
         indices = [i for i, v in enumerate(cam_vars) if v.get()]
         if not indices:
             messagebox.showwarning("No cameras", "Select at least one camera.")
@@ -1705,15 +1320,37 @@ def run_gui() -> int:
             messagebox.showwarning("Invalid count", "Count must be a positive integer.")
             return
 
-        main_outdir = outdir_var.get().strip() or os.path.abspath("./captures")
+        main_outdir = os.path.expanduser(outdir_var.get().strip()) or os.path.abspath("./captures")
+        main_outdir = os.path.abspath(main_outdir)
         outdir_var.set(main_outdir)
-        os.makedirs(main_outdir, exist_ok=True)
+        try:
+            os.makedirs(main_outdir, exist_ok=True)
+            # exist_ok short-circuits on an existing directory without testing
+            # writability, so an existing read-only folder passed this check
+            # and then failed in the worker instead.
+            if not os.access(main_outdir, os.W_OK):
+                raise PermissionError(f"not writable: {main_outdir}")
+        except OSError as e:
+            messagebox.showerror(
+                "Cannot use that folder",
+                f"{main_outdir}\n\n{e}\n\nPick a different output folder.",
+            )
+            return
+
+        # Snapshot the chosen devices now, on the main thread; Rescan mutates
+        # the shared `devices` list and the worker must not index into it.
+        chosen = [devices[i] for i in indices if i < len(devices)]
+        if not chosen:
+            messagebox.showwarning("No cameras", "Select at least one camera.")
+            return
+
         capturing[0] = True
+        set_capture_enabled(False)
         _clear_preview_strip()  # refill as each camera finishes
         threading.Thread(
             target=worker,
             args=(
-                indices, count, main_outdir,
+                chosen, count, main_outdir,
                 plate_color_var.get(), bolts_size_var.get(),
             ),
             daemon=True,
@@ -1735,7 +1372,7 @@ def run_gui() -> int:
             status_var.set("No cameras detected. Connect a camera and click Rescan.")
 
     bar, bar_inner = _rounded_panel(
-        root, fill=DORI_CARD, radius=16, shadow=True, canvas_bg=DORI_BG,
+        bar_slot, fill=DORI_CARD, radius=16, shadow=True, canvas_bg=DORI_BG,
     )
     bar.pack(fill="x", padx=28, pady=(0, 8))
     bar_pad = tk.Frame(bar_inner, bg=DORI_CARD)
@@ -1767,15 +1404,14 @@ def run_gui() -> int:
 
     row2 = tk.Frame(bar_pad, bg=DORI_CARD)
     row2.pack(fill="x", pady=(14, 0))
-    _pill_button(
+    capture_btn[0] = _pill_button(
         row2, "Capture", start_capture, kind="solid", canvas_bg=DORI_CARD,
-    ).pack(side="right")
+    )
+    capture_btn[0].pack(side="right")
     _pill_button(
         row2, "Rescan", rescan, kind="outline", canvas_bg=DORI_CARD,
     ).pack(side="right", padx=(0, 10))
 
-    status_row = tk.Frame(root, bg=DORI_BG)
-    status_row.pack(fill="x", padx=28, pady=(0, 12))
     status_label = tk.Label(
         status_row, textvariable=status_var, anchor="w", justify="left",
         bg=DORI_BG, fg=_status_annotation_color(status_var.get()),
@@ -1794,6 +1430,24 @@ def run_gui() -> int:
             status_label.configure(wraplength=wrap)
 
     root.bind("<Configure>", _on_root_configure)
+
+    def _on_close():
+        # The capture worker is a daemon thread: closing the window returns
+        # from mainloop and the interpreter stops it wherever it happens to
+        # be. The shot manifest is now rewritten after every camera, so an
+        # interrupted run still documents what it captured — but confirm
+        # anyway rather than silently truncating a run in progress.
+        if capturing[0]:
+            if not messagebox.askokcancel(
+                "Capture in progress",
+                "A capture is still running. Closing now stops it — images "
+                "already written stay on disk and the shot manifest records "
+                "what completed.\n\nClose anyway?",
+            ):
+                return
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
 
     poll_queue()
     root.mainloop()

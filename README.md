@@ -11,6 +11,11 @@ Viewer — the script never writes acquisition parameters in its default flow.
 Requires Python 3.9 or newer. `pip install pypylon` gets you a prebuilt
 wheel on all three OSes below — no compiling anything.
 
+`pip install Pillow` as well if you want the GUI's post-capture JPEG
+previews. It is optional: without it capture works normally and previews
+are skipped with a note on the status line. The prebuilt executables bundle
+it already.
+
 **Close Pylon Viewer (or disconnect its cameras there) before running this
 script**, on any OS. Basler cameras only allow one exclusive connection at a
 time — if Viewer is still connected, this script will fail to open the
@@ -86,8 +91,22 @@ python3 capture_cameras.py --cameras all --count 10 --format tiff --outdir ./cap
 
 - `--cameras` — comma-separated indices (e.g. `0,2`) or `all`
 - `--count` — images to capture per camera
-- `--format` — `tiff` (default, lossless/full bit depth), `png`, or `bmp` (note: BMP always saves 8-bit)
-- `--outdir` — output directory (default `./captures`); each camera gets its own subfolder inside it, named `<model>_<serial>`
+- `--format` — `tiff` (lossless/full bit depth), `png`, or `bmp` (note: BMP
+  always saves 8-bit)
+- `--outdir` — output directory; each camera gets its own subfolder inside
+  it, named `<model>_<serial>`
+
+**Every flag is prompted for interactively when omitted** — there are no
+argparse defaults, so a scriptable invocation must pass all four. Omitting
+one under cron/systemd (no stdin) exits 1 with a message rather than
+capturing. The `tiff` / `./captures` defaults shown in the prompts apply
+only to the interactive flow.
+
+**Exit codes:** `0` every selected camera saved every requested image;
+`1` a camera failed to open, errored mid-capture, or saved fewer images
+than requested (also: no cameras found, bad arguments, pypylon missing);
+`2` argparse usage error; `130` interrupted. A short capture is a failure —
+`script-grabber ... && rsync ...` will not archive a partial run.
 
 Optional session GUI (camera selection + plate/bolts + capture):
 
@@ -101,8 +120,8 @@ python3 capture_cameras.py --gui
   shot's `capture_manifest.json`.
 - **BMP only** in the GUI (read-only label). Use the CLI for TIFF/PNG.
 - **Folder layout:** Browse picks the MAIN outdir. Each Capture click
-  creates `<main>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/` from the
-  local computer's date/time (e.g. `./captures/09-04/Black_Big/143052/`).
+  creates `<main>/<YYYY-MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/` from the
+  local computer's date/time (e.g. `./captures/2026-09-04/Black_Big/143052/`).
   Opening a date folder shows one subfolder per plate/bolts combo
   (`Black_Big`, `Silver_Small`, …); each Capture press adds a new time
   folder inside the matching combo. All selected cameras for that press
@@ -110,8 +129,8 @@ python3 capture_cameras.py --gui
   plus `capture_manifest.json`. Count `N` → `Alias_001.bmp` … `Alias_00N.bmp`.
 - **Camera names by serial:** `40044823`→NorthCam, `40048976`→SouthCam,
   `40519358`→TopCam (shown on the camera card). Unknown serials fall back
-  to `sanitize(model)_serial`. Capture is sequential (no GUI Group/PTP).
-- Controls: Rescan, Browse, Capture, Count, Folder — no Apply Settings.
+  to `sanitize(model)_serial`. Capture is sequential.
+- Controls: Rescan, Browse, Capture, Count, Folder.
 - **JPEG previews (v1.3.3+):** after Capture, the GUI shows one JPEG
   thumbnail per camera that saved images (labeled NorthCam / SouthCam /
   TopCam, etc.), and writes `preview_<Alias>.jpg` into the shot folder.
@@ -158,7 +177,7 @@ $env:PYLON_CAMEMU=2; python capture_cameras.py
 under `<outdir>/<model>_<serial>/`.
 
 **GUI:** images are saved as `<Alias>_<shot:03d>.bmp` under
-`<main_outdir>/<MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
+`<main_outdir>/<YYYY-MM-DD>/<PlateColor>_<BoltsSize>/<HHMMSS>/`
 (local date/time when Capture is clicked; plate/bolts combo groups shots
 under the date folder).
 
@@ -199,21 +218,19 @@ Notes:
 - **Verified end-to-end, including on real hardware:** the emulator-based CLI
   path (`PYLON_CAMEMU`) works correctly from the frozen executable, `--version`
   prints correctly, and the GUI renders correctly (confirmed via an Xvfb
-  screenshot with emulated cameras — both camera rows, the Group/Lens two-row
-  layout, and all six bottom-bar controls including Rescan). **Real GigE
+  screenshot with emulated cameras — the camera rows and the
+  bottom-bar controls). **Real GigE
   camera discovery was confirmed working on an actual Ubuntu machine with real
   cameras attached** — copied the executable over with no Python/pip/venv on
   that machine at all, ran `--gui`, and it found and captured from a real
   camera with zero extra setup. GenTL discovery is genuinely self-contained in
   the frozen bundle, as hoped — no `GENICAM_GENTL64_PATH` workaround was
-  needed. (Not yet separately re-confirmed on real hardware: the Group/Lens/
-  Rescan features specifically — same code path as everything else already
-  proven, so low-risk, but worth a pass before a real multi-camera
-  data-collection session.)
+  needed. (Not yet separately re-confirmed on real hardware: Rescan specifically —
+  same code path as everything else already proven, so low-risk, but worth a
+  pass before a real data-collection session.)
 - If you see a GigE buffer-underrun warning suggesting `pylonGigEConfigurator`
   during a real capture, that's a known network/bandwidth-tuning
-  consideration (see the "Camera groups (hardware sync)" note below), not a
-  packaging defect.
+  consideration, not a packaging defect.
 
 ## Standalone executables (all platforms, via GitHub Actions)
 
@@ -248,21 +265,22 @@ triggered by routine pushes:
 Every job runs the `PYLON_CAMEMU` emulator smoke test before publishing its
 artifact — a build that doesn't actually find/capture from emulated cameras
 fails the job rather than silently shipping. Push a tag matching `v*` (e.g.
-`v1.2.0`) to also publish all three executables to a GitHub Release. **Real
+`v1.2.0`) to also publish all four executables to a GitHub Release. **Real
 GigE hardware discovery is only proven on Linux so far** (see above) — the
 macOS/Windows CI builds are emulator-verified only; treat them the same way
 Linux was treated before its own real-hardware pass.
 
-**Downloading a Release asset**: GitHub Release assets don't preserve the
-executable bit — after downloading, run `chmod +x script-grabber-linux` or
-`chmod +x script-grabber-macos-arm64` (or `-intel`) before running it
-(Windows' `.exe` doesn't need this).
+**Downloading a Release asset**: assets are named with the release tag —
+`script-grabber-v1.4.0-linux`, `-macos-arm64`, `-macos-intel`,
+`-windows.exe`. GitHub Release assets don't preserve the executable bit, so
+after downloading run `chmod +x ./script-grabber-<tag>-linux` (or the macOS
+equivalent) before running it; Windows' `.exe` doesn't need this.
 
 **Unsigned executables**: none of these builds are code-signed or notarized.
 On macOS, Gatekeeper only quarantines files downloaded via a browser/Mail/
 Messages — a file pulled with `gh release download` or `curl` typically
 isn't quarantined at all and just runs. If it *is* quarantined, the reliable
-fix is `xattr -d com.apple.quarantine ./script-grabber-macos-arm64`; the
+fix is `xattr -d com.apple.quarantine ./script-grabber-<tag>-macos-arm64`; the
 classic "right-click → Open" bypass **no longer works** as of macOS Sequoia
 15.1 — if you don't want to use the command line, the only remaining GUI
 path is System Settings → Privacy & Security → "Open Anyway" (appears only
@@ -289,12 +307,12 @@ internal use.
 - **GUI session fields:** Plate Color and Bolts Size are recorded in each
   shot folder's `capture_manifest.json` alongside per-camera file lists.
   See the Usage section above for folder layout and camera aliases.
-- **Hardware-synchronized group capture (library / historical):** the
-  module still contains IEEE 1588 PTP + GigE Vision Scheduled Action
-  Command helpers (`capture_group_synchronized`), but they are **not**
-  wired through the current GUI. They require GigE cameras with PTP
-  support and cannot be exercised against `PYLON_CAMEMU`. See older
-  CHANGELOG entries (1.0–1.1) for the original Group-field workflow.
+- **Hardware-synchronized group capture** (IEEE 1588 PTP + GigE Vision
+  Scheduled Action Commands) was removed from `main` in 1.4.0 and now lives
+  on the **`hardware-sync`** branch. It had no call site from either the CLI
+  or the GUI, so it could not be reached or tested; read that branch and the
+  1.4.0 CHANGELOG entry before restoring it. `setup_ubuntu_gige.sh` — the
+  OS-level network tuning it needed — moved with it.
 - TIFF and PNG output preserve bit depth above 8-bit when the camera's
   current pixel format supports it (e.g. Mono12 → a genuine 16-bit file);
   BMP output is always 8-bit. A warning is logged if the chosen format
@@ -322,82 +340,3 @@ internal use.
   error handling for it is in place but unconfirmed against a real camera.
   Do a short real-hardware run with a small `--count` before relying on
   this for a full data-collection session.
-- **Camera groups (hardware sync) — verified end-to-end against real
-  hardware** (acA4112-8gc, a2A4200-12gcBAS, a2A4504-5gcBAS): PTP converged,
-  the broadcast Action Command was accepted by real cameras and fired their
-  `FrameStart` at the same scheduled instant, and a real, valid image was
-  captured and saved. `TriggerMode`/`TriggerSource` correctly restored to
-  their pre-capture values in every run, including ones that aborted
-  partway through or timed out during PTP convergence. Real-hardware
-  testing also caught and fixed several bugs the emulator/simulated-node
-  tests could not have (wrong availability-check API, wrong node names for
-  ace 2's PTP status/offset nodes, a wrong assumption about the
-  timestamp-latch value being Unix-epoch-based when it's actually
-  device-relative — see the plan doc's "Step 2 real-hardware findings" for
-  detail). Known caveats found during this testing, not fixed in code
-  (deliberately — they're network/hardware conditions, not this script's to
-  silently override):
-  - `acA4112-8gc` hit a GigE buffer-underrun error (`0xe1000014`) during
-    synchronized capture in this session — a standard GigE Vision
-    bandwidth/packet-size tuning issue (see Basler's `pylonGigEConfigurator`
-    tool), not a sync failure; the Action Command still fired correctly.
-    Hardware-synced capture creates a bandwidth spike (all cameras
-    transmitting at once) that sequential capture avoids by staggering —
-    worth tuning Inter-Packet Delay/packet size for your specific network
-    before relying on multi-camera synchronized capture at full resolution.
-  - `a2A4200-12gcBAS`'s PTP lock was intermittent/flaky in this session
-    (sometimes converged quickly, sometimes timed out after the full 90s) —
-    worth checking that camera's cable/switch port before relying on it in
-    a group.
-  - Ctrl-C during active PTP convergence polling didn't interrupt promptly
-    in this session's (non-interactive, programmatic-signal) test harness —
-    isolated to something in the repeated per-iteration GenICam network
-    calls, not camera-open or PTP-enable themselves. `TriggerMode` was
-    confirmed correctly restored on every exit path tested. Verify directly
-    with a real interactive Ctrl-C before depending on instant
-    interruptibility.
-- **Reliability tuning for grouped capture (added after real-world testing
-  showed a 3rd camera in a group aggravating the buffer-underrun issue
-  above):** grouped/synchronized cameras now get `MaxNumBuffer` raised
-  (default is 10; raised to 16+ for headroom during a synchronized burst)
-  and `AutoPacketSize` enabled (negotiates the largest safe packet size
-  automatically, rather than guessing a jumbo-frame size that might exceed
-  what your NIC/switch path actually supports) — both applied only to
-  grouped cameras, before grabbing starts, and neither needs restoring
-  afterward (both are host-side session settings, not written to the
-  camera). A non-blocking bandwidth check also runs once per group capture:
-  it sums each camera's `GevSCBWA` (actual bandwidth demand at current
-  settings) and logs a warning if the combined total looks tight against
-  one GigE link's ~125MB/s budget — a concrete signal for "this group won't
-  fit on one shared link," not just a guess. The scheduling margin between
-  shots is now adaptive too: starts at the same safe 500ms, but shrinks
-  (with a 100ms floor) after a few consecutive clean rounds, and instantly
-  grows back on any `_ActionLate` — cuts per-shot overhead on longer runs
-  without sacrificing the safety margin when the network needs it.
-  **`AutoPacketSize`/`GevSCBWA` are GigE-transport-specific and cannot be
-  exercised against the `PYLON_CAMEMU` emulator at all** (confirmed: neither
-  node exists on the emulator's node maps) — verified via unit tests with
-  simulated nodes that the surrounding logic (defensive probing, threshold
-  math, buffer-count comparison) is correct.
-  **Real-hardware status (2026-08-28):** 2-camera grouped/synchronized
-  capture with v1.1.0 confirmed working well on real hardware. 3-camera
-  grouped capture — the original motivating case — has **not** been
-  re-confirmed since these changes; testing is deferred for now. Accepted
-  as a reasonable risk for production specifically because typical
-  production hardware uses a 2.5Gb host NIC/PoE switch against 1Gb cameras,
-  giving headroom the dev/test setup's plain 1Gb uplink didn't have (that
-  1Gb link is what originally hit the buffer-underrun/bandwidth-contention
-  issue with 3 cameras). If you deploy on a plain 1Gb host NIC with 3+
-  grouped cameras, re-verify this before trusting it, and watch for
-  `AutoPacketSize not available` or a bandwidth warning in the log output.
-- **`setup_ubuntu_gige.sh`** (repo root): OS-level complement to the above —
-  tunes Ubuntu's network stack for multi-camera GigE bandwidth (jumbo-frame
-  MTU, socket buffer size, NIC ring buffer, interrupt coalescing, real-time
-  thread priority). Two modes: `./setup_ubuntu_gige.sh auto` runs Basler's
-  own `PylonGigEConfigurator auto-all` if the pylon Camera Software Suite is
-  installed; `./setup_ubuntu_gige.sh manual --iface <your-NIC>` applies the
-  same class of tuning directly without needing that install. Always prints
-  the full plan and asks for confirmation before changing anything
-  (`--dry-run` to preview with zero changes, `--yes` to skip the prompt).
-  Idempotent — safe to re-run. Only needed for grouped/synchronized capture;
-  a single camera or sequential capture never needs any of this.

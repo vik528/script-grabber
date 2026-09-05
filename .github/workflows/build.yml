@@ -26,6 +26,16 @@ env:
   PYPYLON_VERSION: "26.7"
   PYINSTALLER_VERSION: "6.22.2"
   PYINSTALLER_HOOKS_CONTRIB_VERSION: "2026.7"
+  # Pillow drives the GUI's post-capture JPEG previews. It was pinned only
+  # in packaging/linux/Dockerfile, so the macOS and Windows binaries were
+  # frozen from an environment with no PIL at all — and because the import
+  # is soft, PyInstaller bundled nothing and emitted no warning. Those two
+  # binaries shipped 1.3.3's headline feature permanently dead, and a
+  # onefile binary cannot be pip-installed into afterwards.
+  PILLOW_VERSION: "11.2.1"
+  # 2 emulated cameras x --count 2. The smoke tests assert on this, so a
+  # build that discovers cameras and saves nothing fails the job.
+  SMOKE_EXPECTED_IMAGES: "4"
 
 jobs:
   build-linux:
@@ -34,7 +44,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build via existing Dockerfile (bakes in the emulator smoke test)
-        run: docker build -f packaging/linux/Dockerfile -t script-grabber-build .
+        # Pass the pins through. Without --build-arg the env: block above
+        # governed only the macOS and Windows jobs while Linux silently used
+        # the Dockerfile's own ARG defaults — so one release tag could ship
+        # four binaries built against two different pypylon versions.
+        run: |
+          docker build -f packaging/linux/Dockerfile \
+            --build-arg PYPYLON_VERSION="${{ env.PYPYLON_VERSION }}" \
+            --build-arg PYINSTALLER_VERSION="${{ env.PYINSTALLER_VERSION }}" \
+            --build-arg PYINSTALLER_HOOKS_CONTRIB_VERSION="${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}" \
+            --build-arg PILLOW_VERSION="${{ env.PILLOW_VERSION }}" \
+            --build-arg SMOKE_EXPECTED_IMAGES="${{ env.SMOKE_EXPECTED_IMAGES }}" \
+            -t script-grabber-build .
 
       - name: Extract executable from the build image
         run: |
@@ -82,13 +103,18 @@ jobs:
           pip install \
             "pypylon==${{ env.PYPYLON_VERSION }}" \
             "pyinstaller==${{ env.PYINSTALLER_VERSION }}" \
-            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}"
+            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}" \
+            "Pillow==${{ env.PILLOW_VERSION }}"
           # Plain "import tkinter" only catches a hard import failure, not
           # the Tcl/Tk *linkage* error that has recurred across multiple
           # GitHub-hosted macOS runner generations and only surfaces once a
           # widget/root window is actually constructed (actions/runner-images
           # #4931, #6442, #11074, #9441) — so construct one here.
           python -c "import tkinter; r = tkinter.Tk(); r.destroy()"
+          # Same fail-fast reasoning as tkinter above: the previews feature
+          # is a soft import, so without this the build succeeds silently
+          # and the defect only shows up on an operator's machine.
+          python -c "from PIL import Image, ImageTk"
 
       - name: Build with PyInstaller
         # Plain --onefile, no custom .spec: confirmed by direct local testing
@@ -104,7 +130,18 @@ jobs:
       - name: Emulator smoke test (no real cameras/display on this runner)
         run: |
           PYLON_CAMEMU=2 ./dist/${{ matrix.artifact_name }} --cameras all --count 2 --format tiff --outdir smoke_test_out
-          ls -la smoke_test_out
+          find smoke_test_out -type f -ls
+          # Assert on images produced, not just on exit status and a
+          # directory that resolve_outdir creates BEFORE grabbing anything.
+          # `find`, not a glob: CLI capture writes into
+          # <outdir>/<model>_<serial>/ subfolders, so a top-level glob
+          # counts zero even on a healthy build.
+          actual=$(find smoke_test_out -name '*.tiff' -type f | wc -l | tr -d ' ')
+          if [ "$actual" -ne "${{ env.SMOKE_EXPECTED_IMAGES }}" ]; then
+            echo "::error::smoke test captured $actual image(s), expected ${{ env.SMOKE_EXPECTED_IMAGES }}"
+            exit 1
+          fi
+          echo "smoke test captured $actual image(s) as expected"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -130,8 +167,10 @@ jobs:
           pip install `
             "pypylon==${{ env.PYPYLON_VERSION }}" `
             "pyinstaller==${{ env.PYINSTALLER_VERSION }}" `
-            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}"
+            "pyinstaller-hooks-contrib==${{ env.PYINSTALLER_HOOKS_CONTRIB_VERSION }}" `
+            "Pillow==${{ env.PILLOW_VERSION }}"
           python -c "import tkinter"
+          python -c "from PIL import Image, ImageTk"
 
       - name: Build with PyInstaller
         # Plain --onefile: confirmed working on the first real CI run
@@ -145,7 +184,16 @@ jobs:
         run: |
           $env:PYLON_CAMEMU = "2"
           ./dist/script-grabber-windows.exe --cameras all --count 2 --format tiff --outdir smoke_test_out
-          Get-ChildItem smoke_test_out
+          Get-ChildItem -Recurse smoke_test_out
+          # Assert on images produced — see the Linux/macOS jobs for why the
+          # search must be recursive.
+          $actual = (Get-ChildItem -Recurse -Filter *.tiff smoke_test_out | Measure-Object).Count
+          $expected = [int]"${{ env.SMOKE_EXPECTED_IMAGES }}"
+          if ($actual -ne $expected) {
+            Write-Error "smoke test captured $actual image(s), expected $expected"
+            exit 1
+          }
+          Write-Host "smoke test captured $actual image(s) as expected"
 
       - uses: actions/upload-artifact@v4
         with:

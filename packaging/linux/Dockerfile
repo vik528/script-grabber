@@ -76,5 +76,18 @@ RUN /build/venv/bin/pyinstaller script-grabber.spec
 # Emulator-based smoke test (no real cameras, no display available in this
 # container — CLI path only; the GUI and real-hardware discovery get
 # verified separately on an actual Ubuntu machine).
+#
+# Asserts on IMAGES PRODUCED, not just on exit status plus a directory that
+# resolve_outdir creates before grabbing anything. Previously a build that
+# enumerated the emulated cameras and then failed every save still passed
+# this step and shipped. `find`, not a glob: CLI capture writes into
+# <outdir>/<model>_<serial>/ subfolders.
+ARG SMOKE_EXPECTED_IMAGES=4
 RUN PYLON_CAMEMU=2 ./dist/script-grabber --cameras all --count 2 --format tiff --outdir /tmp/smoke_test_out \
-    && ls -la /tmp/smoke_test_out
+    && find /tmp/smoke_test_out -type f -ls \
+    && actual="$(find /tmp/smoke_test_out -name '*.tiff' -type f | wc -l | tr -d ' ')" \
+    && if [ "$actual" -ne "${SMOKE_EXPECTED_IMAGES}" ]; then \
+           echo "smoke test captured $actual image(s), expected ${SMOKE_EXPECTED_IMAGES}" >&2; \
+           exit 1; \
+       fi \
+    && echo "smoke test captured $actual image(s) as expected"
