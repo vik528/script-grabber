@@ -32,7 +32,8 @@ in CI, could tell the two apart from a fully successful run.
   to the `hardware-sync` branch** and is no longer in `main`. It had no
   call site from either the CLI or the GUI — it was unreachable, and being
   unreachable it was also untestable. `setup_ubuntu_gige.sh` moved with it.
-  The module is 1830 → 1228 lines.
+  Removing it took the module from 1830 to 1228 lines; the fixes below add
+  some of that back, leaving it at 1484.
 
 **GUI fixes:**
 
