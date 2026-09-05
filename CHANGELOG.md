@@ -3,6 +3,74 @@
 Manual version tracking — this is a single-engineer lab tool, no auto-updater.
 Grab the new `script-grabber-linux` (or platform equivalent) file when told there's a new version.
 
+## 1.4.0 — 2026-09-05
+
+Capture failure is now visible. Previously a run that saved 3 of 10 images
+and a run where every camera failed to open both ended with `Done.`, exit
+code 0, and a green "Capture complete." — nothing in the tool, and nothing
+in CI, could tell the two apart from a fully successful run.
+
+**Behaviour changes (read before upgrading):**
+
+- **The CLI now exits 1** when any camera failed to open, errored
+  mid-capture, or saved fewer images than requested, and prints a
+  per-camera summary (`40044823: 3/10 saved`). A wrapper written as
+  `script-grabber ... && rsync ...` will no longer archive a partial run
+  as a success. Exit codes are documented in the README.
+- **Short captures are recovered, then reported.** The grab loop is driven
+  by frames *saved* rather than frames *retrieved* — `StartGrabbingMax(N)`
+  bounded retrievals, so every incomplete buffer burned one of the N slots
+  and the run ended short in silence. There is now a bounded retry budget,
+  and any remaining shortfall is reported rather than returned silently.
+- **GUI shot folders now include the year**: `<YYYY-MM-DD>/<Plate>_<Bolts>/
+  <HHMMSS>/`. `%m-%d` made lexical and chronological order diverge across a
+  year boundary. Existing folders are untouched.
+- **The shot manifest gains `requested`, `saved` and `error` per camera**,
+  plus a top-level `complete` flag, and is rewritten after every camera so
+  an interrupted run still records what those BMPs are of.
+- **Hardware-synchronized group capture (PTP + Action Commands) has moved
+  to the `hardware-sync` branch** and is no longer in `main`. It had no
+  call site from either the CLI or the GUI — it was unreachable, and being
+  unreachable it was also untestable. `setup_ubuntu_gige.sh` moved with it.
+  The module is 1830 → 1228 lines.
+
+**GUI fixes:**
+
+- Per-camera errors are no longer swallowed. `poll_queue` drains the whole
+  queue inside one Tk callback and Tk does not redraw mid-callback, so
+  every error string was overwritten by "Capture complete." before it was
+  ever painted. Failures now produce a red summary and a dialog.
+- The control bar and status line no longer get pushed out of the window.
+  They were packed *after* the content area claimed the space with
+  `expand=True`, so with three cameras the status line was already
+  invisible at the default 900x640 and the Capture/Rescan bar disappeared
+  after the first capture.
+- The Capture button has a re-entrancy guard and a real disabled state. A
+  double-click previously started a second worker that raced the first on
+  the same shot folder and manifest.
+- The in-progress flag can no longer stick on. An error while creating the
+  shot folder (read-only mount, full disk) killed the worker before it
+  signalled completion, blocking Rescan for the life of the process.
+- Fixed a `TclError` raised on every window resize: `canvas.lower()`
+  resolves to tkinter's `tag_lower`, which needs an item id, so the panels
+  were never restacked either.
+- Closing the window mid-capture now asks first.
+- JSON writes are atomic (temp file + `os.replace`), so an interrupted
+  write can no longer leave an unparseable manifest.
+
+**Build/CI:**
+
+- The emulator smoke test now asserts on **images actually produced** on
+  all three platforms. It previously checked only that the binary exited 0
+  and that the output directory existed — a directory created before
+  grabbing anything — so a build that captured nothing shipped green.
+- **Pillow is installed in the macOS and Windows builds.** It was pinned
+  only in the Linux Dockerfile, so those two binaries were frozen with no
+  PIL at all and shipped 1.3.3's headline previews feature permanently
+  dead, with no build-time warning because the import is soft.
+- The Linux build receives the workflow's version pins via `--build-arg`;
+  it previously ignored them and used the Dockerfile's own defaults.
+
 ## 1.3.3 — 2026-09-04
 
 GUI post-capture JPEG preview frames (Pillow):
@@ -114,9 +182,13 @@ Reliability tuning for grouped (synchronized) capture, added after real
   socket buffers, NIC ring buffer, interrupt coalescing, rtprio) for the
   same bandwidth-contention problem, complementing the code-level changes.
 - **Note**: `AutoPacketSize`/`GevSCBWA` are GigE-specific and untestable
-  against the emulator — verified via unit tests with simulated nodes, but
-  real-hardware confirmation (does it actually take effect / help) is
-  still pending.
+  against the emulator, and real-hardware confirmation (does it actually
+  take effect / help) is still pending.
+  *(Corrected in 1.4.0: this entry originally claimed the surrounding logic
+  was "verified via unit tests with simulated nodes." No test file has ever
+  existed in this repository. The claim was wrong when written and is left
+  struck here rather than quietly deleted, because CHANGELOG.md is
+  published verbatim as every GitHub Release body.)*
 
 ## 1.0.0 — 2026-08-27
 

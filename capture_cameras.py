@@ -25,7 +25,7 @@ have pypylon emulate that many virtual cameras.
 """
 from __future__ import annotations
 
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 import argparse
 import datetime
@@ -85,6 +85,7 @@ class CaptureResult(NamedTuple):
     def summary(self) -> str:
         head = f"{self.serial}: {len(self.saved)}/{self.requested} saved"
         return head if self.error is None else f"{head} — {self.error}"
+
 
 FILE_FORMATS = {
     "tiff": pylon.ImageFileFormat_Tiff,
